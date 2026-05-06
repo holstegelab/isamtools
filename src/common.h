@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <htslib/sam.h>
-#include "backend.h"
 
 #define ISAM_VERSION       "0.1.0"
 #define ISAM_SCHEMA_STORE  "1"
@@ -20,14 +19,11 @@ void *xcalloc(size_t n, size_t s);
 void *xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 
-/* qname hash: FNV-1a 64, returned as int64 (bit-cast) for SQLite INTEGER. */
+/* qname hash: FNV-1a 64, returned as int64 (bit-cast). */
 int64_t qname_hash(const char *qname);
 
 /* path helper: append .isam to a path. caller frees. */
 char *isam_index_path_for(const char *store_path);
-
-/* Return 1 if an existing file has the SQLite database signature. */
-int isam_file_is_sqlite(const char *path);
 
 /* iso8601 utc timestamp, malloc'd */
 char *now_iso8601(void);

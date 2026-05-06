@@ -14,7 +14,6 @@ Required options:
 Optional:
 
 - `--store-index PATH`: store index path. Defaults to `<store>.isam`.
-- `--backend sqlite|lmdb`: output alignment-view backend. Defaults to `sqlite`.
 - `--name NAME`: logical alias for the view.
 - `--allow-missing`: skip input records absent from the canonical store.
 - `--write-index`: run `sort --all` after import.
@@ -26,10 +25,9 @@ Each input record is resolved by QNAME against the store index. By default,
 missing QNAMEs are errors. Imported records preserve view-specific alignment
 fields and aux tags; SEQ/QUAL come from the canonical store during `view`.
 
-With an LMDB-enabled build, `--backend lmdb` writes the alignment view as a
-file-backed LMDB `.isam` containing typed read-dictionary and alignment-record
-DBIs. LMDB creates a sibling lock file named `<path>-lock` while the environment
-is in use.
+`import` writes a file-backed LMDB `.isam` containing typed read-dictionary and
+alignment-record DBIs. LMDB creates a sibling lock file named `<path>-lock`
+while the environment is in use.
 
 ## Examples
 
@@ -37,12 +35,6 @@ is in use.
 isamtools import sample.hg38.bam \
   --store sample.chm13.bam \
   --aln sample.hg38.isam
-
-isamtools import sample.hg38.bam \
-  --backend lmdb \
-  --store sample.chm13.bam \
-  --store-index sample.chm13.bam.lmdb.isam \
-  --aln sample.hg38.lmdb.isam
 
 minimap2 -ax map-ont hg38.fa reads.fq.gz |
   isamtools import - --store sample.chm13.bam --aln sample.hg38.isam

@@ -4,24 +4,13 @@
 #include "common.h"
 #include "backend_lmdb.h"
 
-typedef enum store_backend_kind {
-    STORE_BACKEND_SQLITE = 0,
-    STORE_BACKEND_LMDB = 1
-} store_backend_kind_t;
-
 typedef struct store {
     char       *store_path;
     char       *index_path;
-    store_backend_kind_t backend_kind;
-    sqlite3    *db;            /* opened on the .isam index file (read-only) */
-#ifdef ISAM_ENABLE_LMDB
     lmdb_backend_t *lmdb;
-#endif
     samFile    *sam;           /* canonical BAM/CRAM */
     sam_hdr_t  *hdr;
     int         is_bam;        /* 1 for BAM, 0 for CRAM (or other) */
-    sqlite3_stmt *q_lookup;    /* SELECT ... FROM canonical_read WHERE qname_hash=? AND qname=? */
-    sqlite3_stmt *id_lookup;   /* SELECT ... FROM canonical_read WHERE read_id=? */
 } store_t;
 
 typedef struct store_record {

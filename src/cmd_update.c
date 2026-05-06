@@ -81,41 +81,14 @@ int cmd_update(int argc, char **argv) {
         die("stat '%s': %s", isam_path, strerror(errno));
     if (S_ISDIR(st.st_mode))
         die("'%s' is a directory; LMDB .isam files are file-backed", isam_path);
-    if (!isam_file_is_sqlite(isam_path)) {
-#ifdef ISAM_ENABLE_LMDB
-        lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
-        lmdb_backend_begin(lmdb);
-        for (size_t i = 0; i < n_ops; ++i) {
-            if (ops[i].unset) lmdb_view_delete_meta(lmdb, ops[i].key);
-            else              lmdb_backend_meta_set(lmdb, ops[i].key, ops[i].value);
-        }
-        lmdb_backend_commit(lmdb);
-        lmdb_backend_close(lmdb);
-        free(isam_path);
-        free(ops);
-        return 0;
-#else
-        die("'%s' is an LMDB .isam, but this build has no LMDB support", isam_path);
-#endif
-    }
-
-    sqlite3 *db = db_open(isam_path, SQLITE_OPEN_READWRITE);
-
-    db_exec(db, "BEGIN;");
-    sqlite3_stmt *del = db_prep(db, "DELETE FROM meta WHERE key=?;");
+    lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
+    lmdb_backend_begin(lmdb);
     for (size_t i = 0; i < n_ops; ++i) {
-        if (ops[i].unset) {
-            sqlite3_reset(del);
-            sqlite3_bind_text(del, 1, ops[i].key, -1, SQLITE_STATIC);
-            db_step_done(del);
-        } else {
-            meta_set(db, ops[i].key, ops[i].value);
-        }
+        if (ops[i].unset) lmdb_view_delete_meta(lmdb, ops[i].key);
+        else              lmdb_backend_meta_set(lmdb, ops[i].key, ops[i].value);
     }
-    sqlite3_finalize(del);
-    db_exec(db, "COMMIT;");
-
-    db_close(db);
+    lmdb_backend_commit(lmdb);
+    lmdb_backend_close(lmdb);
     free(isam_path);
     free(ops);
     return 0;

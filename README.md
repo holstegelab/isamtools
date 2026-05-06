@@ -1,9 +1,9 @@
 # isamtools
 
 `isamtools` stores one canonical BAM/CRAM read-payload store and many compact
-SQLite `.isam` alignment views. It is intended for samples aligned repeatedly to
-different references or aligner settings, where duplicating SEQ/QUAL and
-invariant read payload in every BAM/CRAM is wasteful.
+`.isam` alignment views. LMDB is the storage backend. The tool is intended for samples
+aligned repeatedly to different references or aligner settings, where
+duplicating SEQ/QUAL and invariant read payload in every BAM/CRAM is wasteful.
 
 The canonical store keeps QNAME, SEQ, QUAL, and canonical-location hints. Each
 alignment view stores alignment-specific fields such as FLAG, TID, POS, MAPQ,
@@ -24,21 +24,18 @@ isamtools sort --all sample.hg38.isam
 isamtools view sample.hg38.isam chr1:1000000-2000000
 ```
 
-With an LMDB-enabled build, the canonical store index and alignment view can be
-file-backed LMDB `.isam` databases:
+The canonical store index and alignment view are file-backed LMDB `.isam`
+databases:
 
 ```bash
-isamtools index --backend lmdb \
-  -o sample.chm13.bam.lmdb.isam \
-  sample.chm13.bam
+isamtools index -o sample.chm13.bam.isam sample.chm13.bam
 
 isamtools import sample.hg38.bam \
-  --backend lmdb \
   --store sample.chm13.bam \
-  --store-index sample.chm13.bam.lmdb.isam \
-  --aln sample.hg38.lmdb.isam
+  --store-index sample.chm13.bam.isam \
+  --aln sample.hg38.isam
 
-isamtools sort --all sample.hg38.lmdb.isam
+isamtools sort --all sample.hg38.isam
 ```
 
 ## Commands
@@ -99,28 +96,23 @@ isamtools sort --all sample.hg38.isam
 ## Build
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build \
+  -DISAM_LMDB_SOURCE_DIR=/path/to/openldap/libraries/liblmdb
 cmake --build build
 ```
 
 Dependencies:
 
 - htslib
-- SQLite with R*Tree support
+- LMDB source (`mdb.c` and `midl.c`)
 - samtools for the shell tests
 
-### LMDB Backend
+### LMDB Source
 
-SQLite remains the default backend. LMDB support is available for canonical
-store indexes and alignment views in LMDB-enabled builds. Migration details are
-documented in [docs/lmdb-migration.md](docs/lmdb-migration.md).
-
-LMDB support is opt-in and is intended to be statically compiled into
-`libisam.a` from LMDB source:
+LMDB is statically compiled into `libisam.a` from source:
 
 ```bash
 cmake -S . -B build-lmdb \
-  -DISAM_ENABLE_LMDB=ON \
   -DISAM_LMDB_SOURCE_DIR=/path/to/openldap/libraries/liblmdb
 cmake --build build-lmdb
 ```
@@ -129,7 +121,6 @@ When network access is explicitly available, CMake can fetch the source:
 
 ```bash
 cmake -S . -B build-lmdb \
-  -DISAM_ENABLE_LMDB=ON \
   -DISAM_LMDB_FETCH=ON
 ```
 
@@ -143,6 +134,7 @@ tests/functional.sh
 tests/smoke.sh
 tests/lmdb_store.sh
 tests/lmdb_alignment.sh
+tests/lmdb_compat.sh
 N=50000 tests/profile_small.sh
 ```
 

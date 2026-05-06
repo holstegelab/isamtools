@@ -91,6 +91,9 @@ Region iterators require an interval index. Build one with:
 isamtools sort --interval sample.hg38.isam
 ```
 
+LMDB views support sequential reads, region iterators, QNAME iterators, named
+subset iterators, and region-filtered subset iterators through this API.
+
 ## Errors
 
 ```c
@@ -103,7 +106,7 @@ Common codes:
 - `ISAM_OK`
 - `ISAM_EOF`
 - `ISAM_ERR_IO`
-- `ISAM_ERR_SQLITE`
+- `ISAM_ERR_BACKEND`
 - `ISAM_ERR_MISSING_QNAME`
 - `ISAM_ERR_STALE_INDEX`
 - `ISAM_ERR_NO_INDEX`

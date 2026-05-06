@@ -1,5 +1,4 @@
 #include "common.h"
-#include "schema.h"
 #include "store.h"
 #include "view.h"
 #include "../include/isam/isam.h"
@@ -17,7 +16,6 @@ static void usage(void) {
         "  --store PATH         Canonical store (BAM/CRAM).\n"
         "  --store-index PATH   Store .isam (default <store>.isam).\n"
         "  --aln PATH           Output alignment-view .isam.\n"
-        "  --backend B          Output backend: sqlite (default) or lmdb.\n"
         "  --name NAME          Logical alias for the alignment view.\n"
         "  --allow-missing      Skip records whose QNAME isn't in the store.\n"
         "  --write-index        Run `sort --all` after import.\n"
@@ -32,7 +30,6 @@ int cmd_import(int argc, char **argv) {
     const char *store_idx  = NULL;
     const char *aln_path   = NULL;
     const char *name_alias = NULL;
-    view_backend_kind_t out_backend = VIEW_BACKEND_SQLITE;
     int allow_missing = 0;
     int write_index   = 0;
 
@@ -43,7 +40,6 @@ int cmd_import(int argc, char **argv) {
         {"name",          required_argument, 0, 1003},
         {"allow-missing", no_argument,       0, 1004},
         {"write-index",   no_argument,       0, 1005},
-        {"backend",       required_argument, 0, 1006},
         {"help",          no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -56,11 +52,6 @@ int cmd_import(int argc, char **argv) {
         case 1003: name_alias = optarg; break;
         case 1004: allow_missing = 1;   break;
         case 1005: write_index   = 1;   break;
-        case 1006:
-            if (strcmp(optarg, "sqlite") == 0) out_backend = VIEW_BACKEND_SQLITE;
-            else if (strcmp(optarg, "lmdb") == 0) out_backend = VIEW_BACKEND_LMDB;
-            else die("unknown backend '%s' (expected sqlite or lmdb)", optarg);
-            break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
@@ -87,31 +78,23 @@ int cmd_import(int argc, char **argv) {
     if (!in_hdr) die("cannot read header from input '%s'", input_path);
 
     /* Open / create output view. */
-    view_t *v = view_open_write_backend(aln_path, out_backend);
+    view_t *v = view_open_write(aln_path);
 
     /* Persist view metadata. */
-    view_meta_set(v, "backend",           out_backend == VIEW_BACKEND_LMDB ? "lmdb" : "sqlite");
+    view_meta_set(v, "backend",           "lmdb");
     view_meta_set(v, "isam_type",         "alignment");
     view_meta_set(v, "isam_version",      ISAM_SCHEMA_VIEW);
     view_meta_set(v, "isamtools_version", ISAM_VERSION);
     view_meta_set(v, "store_path",        store_path);
     view_meta_set(v, "store_index_path",  store_idx);
-    char *store_name = NULL, *shh = NULL, *ssh = NULL;
-    if (store->backend_kind == STORE_BACKEND_SQLITE) {
-        store_name = meta_get(store->db, "name");
-        shh = meta_get(store->db, "store_header_hash");
-        ssh = meta_get(store->db, "store_sq_hash");
-    }
-#ifdef ISAM_ENABLE_LMDB
-    else if (store->backend_kind == STORE_BACKEND_LMDB) {
-        store_name = lmdb_backend_meta_get(store->lmdb, "name");
-        shh = lmdb_backend_meta_get(store->lmdb, "store_header_hash");
-        ssh = lmdb_backend_meta_get(store->lmdb, "store_sq_hash");
-    }
-#endif
+    char *store_name = lmdb_backend_meta_get(store->lmdb, "name");
+    char *shh = lmdb_backend_meta_get(store->lmdb, "store_header_hash");
+    char *ssh = lmdb_backend_meta_get(store->lmdb, "store_sq_hash");
+    char *sml = lmdb_backend_meta_get(store->lmdb, "store_max_read_len");
     if (store_name) { view_meta_set(v, "store_name", store_name); free(store_name); }
     if (shh) { view_meta_set(v, "store_header_hash", shh); free(shh); }
     if (ssh) { view_meta_set(v, "store_sq_hash", ssh); free(ssh); }
+    if (sml) { view_meta_set(v, "store_max_read_len", sml); free(sml); }
     if (name_alias) view_meta_set(v, "name", name_alias);
     char *ts = now_iso8601(); view_meta_set(v, "created_at", ts); free(ts);
     view_meta_set(v, "indexed_coord",    "0");
@@ -121,31 +104,11 @@ int cmd_import(int argc, char **argv) {
 
     view_set_header(v, in_hdr);
 
-    sqlite3_stmt *ins_rd = NULL;
-    sqlite3_stmt *ins_ar = NULL;
-    if (v->backend_kind == VIEW_BACKEND_SQLITE) {
-        /* Wipe staging tables to give clean import semantics. */
-        db_exec(v->db, "DELETE FROM aln_record_import;");
-        db_exec(v->db, "DELETE FROM read_dict;");
-
-        ins_rd = db_prep(v->db,
-            "INSERT INTO read_dict(store_read_id, qname, qname_hash) VALUES(?,?,?) "
-            "ON CONFLICT(store_read_id) DO NOTHING;");
-        ins_ar = db_prep(v->db,
-            "INSERT INTO aln_record_import("
-            "  store_read_id, flag, tid, pos0, end0, mapq,"
-            "  n_cigar, cigar, mate_tid, mate_pos0, tlen,"
-            "  aux_codec, aux, record_order, is_unmapped"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,'raw',?,?,?);");
-        db_exec(v->db, "BEGIN;");
-    }
-#ifdef ISAM_ENABLE_LMDB
-    else {
-        lmdb_backend_begin(v->lmdb);
-    }
-#endif
+    lmdb_backend_begin(v->lmdb);
     bam1_t *b = bam_init1();
     int64_t n_in = 0, n_kept = 0, n_missing = 0;
+    int64_t max_ref_span = 0;
+    int64_t max_query_len = 0;
     int64_t batch = 0;
     const int64_t BATCH_SIZE = 50000;
 
@@ -175,102 +138,56 @@ int cmd_import(int argc, char **argv) {
         const uint32_t *cigar = bam_get_cigar(b);
         const uint8_t  *aux   = bam_get_aux(b);
         int aux_len = bam_get_l_aux(b);
-
-        if (v->backend_kind == VIEW_BACKEND_SQLITE) {
-            /* Mirror identity into view's read_dict (idempotent on store_read_id). */
-            sqlite3_reset(ins_rd);
-            sqlite3_bind_int64(ins_rd, 1, srec.read_id);
-            sqlite3_bind_text (ins_rd, 2, qname, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(ins_rd, 3, qh);
-            db_step_done(ins_rd);
-
-            sqlite3_reset(ins_ar);
-            sqlite3_bind_int64(ins_ar, 1, srec.read_id);
-            sqlite3_bind_int  (ins_ar, 2, b->core.flag);
-            if (b->core.tid < 0) sqlite3_bind_null(ins_ar, 3);
-            else                 sqlite3_bind_int (ins_ar, 3, b->core.tid);
-            if (is_unmapped || b->core.pos < 0) sqlite3_bind_null(ins_ar, 4);
-            else                 sqlite3_bind_int64(ins_ar, 4, (int64_t)b->core.pos);
-            if (is_unmapped)     sqlite3_bind_null(ins_ar, 5);
-            else                 sqlite3_bind_int64(ins_ar, 5, (int64_t)bam_endpos(b));
-            sqlite3_bind_int  (ins_ar, 6, b->core.qual);
-            sqlite3_bind_int  (ins_ar, 7, n_cigar);
-            if (n_cigar > 0)
-                sqlite3_bind_blob(ins_ar, 8, cigar, n_cigar * 4, SQLITE_TRANSIENT);
-            else
-                sqlite3_bind_null(ins_ar, 8);
-            if (b->core.mtid < 0) sqlite3_bind_null(ins_ar, 9);
-            else                  sqlite3_bind_int (ins_ar, 9, b->core.mtid);
-            if (b->core.mpos < 0) sqlite3_bind_null(ins_ar, 10);
-            else                  sqlite3_bind_int64(ins_ar, 10, (int64_t)b->core.mpos);
-            sqlite3_bind_int64(ins_ar, 11, (int64_t)b->core.isize);
-            if (aux_len > 0)
-                sqlite3_bind_blob(ins_ar, 12, aux, aux_len, SQLITE_TRANSIENT);
-            else
-                sqlite3_bind_null(ins_ar, 12);
-            sqlite3_bind_int64(ins_ar, 13, n_kept);
-            sqlite3_bind_int  (ins_ar, 14, is_unmapped);
-            db_step_done(ins_ar);
+        if ((int64_t)b->core.l_qseq > max_query_len)
+            max_query_len = b->core.l_qseq;
+        if (!is_unmapped && b->core.tid >= 0 && b->core.pos >= 0) {
+            int64_t span = (int64_t)bam_endpos(b) - (int64_t)b->core.pos;
+            if (span > max_ref_span) max_ref_span = span;
         }
-#ifdef ISAM_ENABLE_LMDB
-        else {
-            lmdb_view_put_read(v->lmdb, srec.read_id, qname, qh);
-            lmdb_view_record_t rec = {
-                .aln_id = n_kept + 1,
-                .store_read_id = srec.read_id,
-                .flag = b->core.flag,
-                .tid = b->core.tid,
-                .pos0 = (is_unmapped || b->core.pos < 0) ? -1 : (int64_t)b->core.pos,
-                .end0 = is_unmapped ? -1 : (int64_t)bam_endpos(b),
-                .mapq = b->core.qual,
-                .n_cigar = n_cigar,
-                .cigar = (uint32_t *)cigar,
-                .mate_tid = b->core.mtid,
-                .mate_pos0 = b->core.mpos < 0 ? -1 : (int64_t)b->core.mpos,
-                .tlen = (int64_t)b->core.isize,
-                .aux = (uint8_t *)aux,
-                .aux_len = aux_len,
-                .record_order = n_kept,
-                .is_unmapped = is_unmapped
-            };
-            lmdb_view_put_import_record(v->lmdb, &rec);
-        }
-#endif
+
+        lmdb_view_put_read(v->lmdb, srec.read_id, qname, qh);
+        lmdb_view_record_t rec = {
+            .aln_id = n_kept + 1,
+            .store_read_id = srec.read_id,
+            .flag = b->core.flag,
+            .tid = b->core.tid,
+            .pos0 = (is_unmapped || b->core.pos < 0) ? -1 : (int64_t)b->core.pos,
+            .end0 = is_unmapped ? -1 : (int64_t)bam_endpos(b),
+            .mapq = b->core.qual,
+            .n_cigar = n_cigar,
+            .cigar = (uint32_t *)cigar,
+            .mate_tid = b->core.mtid,
+            .mate_pos0 = b->core.mpos < 0 ? -1 : (int64_t)b->core.mpos,
+            .tlen = (int64_t)b->core.isize,
+            .aux = (uint8_t *)aux,
+            .aux_len = aux_len,
+            .record_order = n_kept,
+            .is_unmapped = is_unmapped
+        };
+        lmdb_view_put_import_record(v->lmdb, &rec);
         store_record_clear(&srec);
 
         ++n_kept;
         ++n_in;
         ++batch;
         if (batch >= BATCH_SIZE) {
-            if (v->backend_kind == VIEW_BACKEND_SQLITE)
-                db_exec(v->db, "COMMIT; BEGIN;");
-#ifdef ISAM_ENABLE_LMDB
-            else {
-                lmdb_backend_commit(v->lmdb);
-                lmdb_backend_begin(v->lmdb);
-            }
-#endif
+            lmdb_backend_commit(v->lmdb);
+            lmdb_backend_begin(v->lmdb);
             batch = 0;
             fprintf(stderr, "isamtools import: %lld in / %lld kept\r",
                     (long long)n_in, (long long)n_kept);
         }
     }
-    if (v->backend_kind == VIEW_BACKEND_SQLITE) {
-        db_exec(v->db, "COMMIT;");
-        sqlite3_finalize(ins_rd);
-        sqlite3_finalize(ins_ar);
-    }
-#ifdef ISAM_ENABLE_LMDB
-    else {
-        lmdb_backend_commit(v->lmdb);
-    }
-#endif
+    lmdb_backend_commit(v->lmdb);
     bam_destroy1(b);
     sam_hdr_destroy(in_hdr);
     sam_close(in);
 
     fprintf(stderr, "isamtools import: %lld in, %lld kept, %lld missing\n",
             (long long)n_in, (long long)n_kept, (long long)n_missing);
+
+    view_meta_set_i64(v, "view_max_ref_span", max_ref_span);
+    view_meta_set_i64(v, "view_max_query_len", max_query_len);
 
     view_close(v);
     store_close(store);

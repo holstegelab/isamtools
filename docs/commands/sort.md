@@ -10,19 +10,16 @@ isamtools sort [options] <file.isam|store.bam|store.cram>
 
 - `-n`: build name/read indexes.
 - `--coord`: build coordinate-clustered mapped/unmapped tables.
-- `--interval`: build the R*Tree interval index. This also builds coordinate tables.
+- `--interval`: build the LMDB checkpoint interval index. This also builds coordinate tables.
 - `--all`: build all indexes.
 - `-h, --help`: show command help.
 
 ## Alignment Views
 
 For alignment views, `sort` does not reorder the input file on disk like
-`samtools sort`. It builds SQLite tables and indexes used for coordinate scans,
-name scans, and interval overlap queries.
-
-For LMDB alignment views, `sort` populates ordered LMDB DBIs for coordinate and
-unmapped scans, marks the existing read-name fanout as available, and builds a
-fixed-bin interval DBI for region queries.
+`samtools sort`. It populates ordered LMDB DBIs for coordinate and unmapped
+scans, marks the existing read-name fanout as available, and builds checkpoint
+metadata for region queries when needed.
 
 ## Examples
 

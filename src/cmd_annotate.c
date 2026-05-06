@@ -1,8 +1,7 @@
 #include "common.h"
-#include "schema.h"
+#include "backend_lmdb.h"
 
 #include <getopt.h>
-#include <ctype.h>
 
 static void usage(void) {
     fputs(
@@ -38,42 +37,26 @@ static void rstrip(char *s) {
         s[--n] = 0;
 }
 
-/* Resolve qname -> integer id (read_id for store, store_read_id for view).
- * Returns 1 on hit, 0 on miss. */
-static int lookup_qname(sqlite3_stmt *q, const char *qname, int64_t *out) {
-    sqlite3_reset(q);
-    sqlite3_bind_int64(q, 1, qname_hash(qname));
-    sqlite3_bind_text (q, 2, qname, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(q);
-    if (rc == SQLITE_ROW) { *out = sqlite3_column_int64(q, 0); return 1; }
-    if (rc != SQLITE_DONE)
-        die("annotate lookup failed: %s",
-            sqlite3_errmsg(sqlite3_db_handle(q)));
-    return 0;
+static int lookup_qname(lmdb_backend_t *lmdb,
+                        int is_store,
+                        const char *qname,
+                        int64_t *out) {
+    if (is_store) {
+        lmdb_store_record_t rec;
+        if (!lmdb_store_lookup_qname(lmdb, qname_hash(qname), qname, &rec))
+            return 0;
+        *out = rec.read_id;
+        lmdb_store_record_clear(&rec);
+        return 1;
+    }
+    return lmdb_view_lookup_qname(lmdb, qname_hash(qname), qname, out);
 }
 
-static void annotate_tags(sqlite3 *db, int is_store,
+static void annotate_tags(lmdb_backend_t *lmdb, int is_store,
                           const char *path, const char *cmdline,
                           int allow_missing) {
     FILE *f = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
     if (!f) die("cannot open '%s'", path);
-
-    sqlite3_stmt *lookup = db_prep(db, is_store
-        ? "SELECT read_id FROM canonical_read "
-          "WHERE qname_hash=? AND qname=? LIMIT 1;"
-        : "SELECT store_read_id FROM read_dict "
-          "WHERE qname_hash=? AND qname=? LIMIT 1;");
-    sqlite3_stmt *ins = db_prep(db, is_store
-        ? "INSERT INTO read_tag(read_id, tag, type, value, source) "
-          "VALUES(?,?,?,?,?) "
-          "ON CONFLICT(read_id, tag) DO UPDATE SET "
-          "  type=excluded.type, value=excluded.value, source=excluded.source;"
-        : "INSERT INTO read_tag(store_read_id, tag, type, value, source) "
-          "VALUES(?,?,?,?,?) "
-          "ON CONFLICT(store_read_id, tag) DO UPDATE SET "
-          "  type=excluded.type, value=excluded.value, source=excluded.source;");
-
-    db_exec(db, "BEGIN;");
 
     char *line = NULL; size_t cap = 0;
     ssize_t n;
@@ -88,7 +71,7 @@ static void annotate_tags(sqlite3 *db, int is_store,
         *tab = 0;
 
         int64_t id;
-        if (!lookup_qname(lookup, qname, &id)) {
+        if (!lookup_qname(lmdb, is_store, qname, &id)) {
             if (!allow_missing)
                 die("annotate: qname '%s' not present in target "
                     "(use --allow-missing to skip)", qname);
@@ -106,74 +89,29 @@ static void annotate_tags(sqlite3 *db, int is_store,
             char type[2] = { cur[3], 0 };
             const char *val = cur + 5;
 
-            sqlite3_reset(ins);
-            sqlite3_bind_int64(ins, 1, id);
-            sqlite3_bind_text (ins, 2, tag,  -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text (ins, 3, type, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_blob (ins, 4, val, (int)strlen(val), SQLITE_TRANSIENT);
-            sqlite3_bind_text (ins, 5, path, -1, SQLITE_STATIC);
-            db_step_done(ins);
+            lmdb_read_tag_put(lmdb, id, tag, type, val, strlen(val), path);
             ++n_tags;
             cur = next ? next + 1 : NULL;
         }
         ++n_rows;
     }
-    db_exec(db, "COMMIT;");
-    sqlite3_finalize(ins);
-    sqlite3_finalize(lookup);
+    lmdb_annotation_meta_put(lmdb, "tag", path, cmdline);
     free(line);
     if (f != stdin) fclose(f);
-
-    sqlite3_stmt *am = db_prep(db,
-        "INSERT INTO annotation_meta(kind, source, command_line, created_at) "
-        "VALUES('tag', ?, ?, ?);");
-    sqlite3_bind_text(am, 1, path,    -1, SQLITE_STATIC);
-    sqlite3_bind_text(am, 2, cmdline, -1, SQLITE_STATIC);
-    char *ts = now_iso8601();
-    sqlite3_bind_text(am, 3, ts, -1, SQLITE_TRANSIENT);
-    db_step_done(am);
-    sqlite3_finalize(am);
-    free(ts);
 
     fprintf(stderr,
             "isamtools annotate: %lld rows, %lld tags, %lld missing\n",
             (long long)n_rows, (long long)n_tags, (long long)n_missing);
 }
 
-static void annotate_subset(sqlite3 *db, int is_store,
+static void annotate_subset(lmdb_backend_t *lmdb, int is_store,
                             const char *subset_name, const char *desc,
                             const char *path, const char *cmdline,
                             int allow_missing) {
-    sqlite3_stmt *up = db_prep(db,
-        "INSERT INTO subset(name, description, created_at) VALUES(?,?,?) "
-        "ON CONFLICT(name) DO UPDATE SET "
-        "  description=COALESCE(excluded.description, subset.description) "
-        "RETURNING subset_id;");
-    sqlite3_bind_text(up, 1, subset_name, -1, SQLITE_STATIC);
-    if (desc) sqlite3_bind_text(up, 2, desc, -1, SQLITE_STATIC);
-    else      sqlite3_bind_null(up, 2);
-    char *ts = now_iso8601();
-    sqlite3_bind_text(up, 3, ts, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(up);
-    if (rc != SQLITE_ROW) die("subset upsert failed: %s", sqlite3_errmsg(db));
-    int64_t subset_id = sqlite3_column_int64(up, 0);
-    sqlite3_finalize(up);
-    free(ts);
-
-    sqlite3_stmt *lookup = db_prep(db, is_store
-        ? "SELECT read_id FROM canonical_read "
-          "WHERE qname_hash=? AND qname=? LIMIT 1;"
-        : "SELECT store_read_id FROM read_dict "
-          "WHERE qname_hash=? AND qname=? LIMIT 1;");
-    sqlite3_stmt *ins = db_prep(db, is_store
-        ? "INSERT OR IGNORE INTO subset_read(subset_id, read_id) VALUES(?,?);"
-        : "INSERT OR IGNORE INTO subset_read(subset_id, store_read_id) "
-          "VALUES(?,?);");
-
     FILE *f = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
     if (!f) die("cannot open '%s'", path);
 
-    db_exec(db, "BEGIN;");
+    int64_t subset_id = lmdb_subset_upsert(lmdb, subset_name, desc);
     char *line = NULL; size_t cap = 0;
     ssize_t n;
     int64_t n_added = 0, n_missing = 0;
@@ -182,7 +120,7 @@ static void annotate_subset(sqlite3 *db, int is_store,
         if (!*line || *line == '#') continue;
 
         int64_t id;
-        if (!lookup_qname(lookup, line, &id)) {
+        if (!lookup_qname(lmdb, is_store, line, &id)) {
             if (!allow_missing)
                 die("annotate: qname '%s' not present in target "
                     "(use --allow-missing to skip)", line);
@@ -190,28 +128,12 @@ static void annotate_subset(sqlite3 *db, int is_store,
             continue;
         }
 
-        sqlite3_reset(ins);
-        sqlite3_bind_int64(ins, 1, subset_id);
-        sqlite3_bind_int64(ins, 2, id);
-        db_step_done(ins);
+        lmdb_subset_add_read(lmdb, subset_id, id);
         ++n_added;
     }
-    db_exec(db, "COMMIT;");
-    sqlite3_finalize(ins);
-    sqlite3_finalize(lookup);
+    lmdb_annotation_meta_put(lmdb, "subset", path, cmdline);
     free(line);
     if (f != stdin) fclose(f);
-
-    sqlite3_stmt *am = db_prep(db,
-        "INSERT INTO annotation_meta(kind, source, command_line, created_at) "
-        "VALUES('subset', ?, ?, ?);");
-    sqlite3_bind_text(am, 1, path,    -1, SQLITE_STATIC);
-    sqlite3_bind_text(am, 2, cmdline, -1, SQLITE_STATIC);
-    char *ts2 = now_iso8601();
-    sqlite3_bind_text(am, 3, ts2, -1, SQLITE_TRANSIENT);
-    db_step_done(am);
-    sqlite3_finalize(am);
-    free(ts2);
 
     fprintf(stderr, "isamtools annotate: subset '%s' += %lld qnames, %lld missing\n",
             subset_name, (long long)n_added, (long long)n_missing);
@@ -247,8 +169,8 @@ int cmd_annotate(int argc, char **argv) {
     if (!from) die("--from is required");
 
     char *isam_path = resolve_isam_path(argv[optind]);
-    sqlite3 *db = db_open(isam_path, SQLITE_OPEN_READWRITE);
-    char *type = meta_get(db, "isam_type");
+    lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
+    char *type = lmdb_backend_meta_get(lmdb, "isam_type");
     if (!type) die("'%s' has no isam_type meta", isam_path);
     int is_store = (strcmp(type, "store") == 0);
     if (!is_store && strcmp(type, "alignment") != 0)
@@ -263,11 +185,11 @@ int cmd_annotate(int argc, char **argv) {
                  "%s%s", i ? " " : "", argv[i]);
     }
 
-    if (subset) annotate_subset(db, is_store, subset, desc, from, cmdbuf,
+    if (subset) annotate_subset(lmdb, is_store, subset, desc, from, cmdbuf,
                                 allow_missing);
-    else        annotate_tags  (db, is_store, from, cmdbuf, allow_missing);
+    else        annotate_tags  (lmdb, is_store, from, cmdbuf, allow_missing);
 
-    db_close(db);
+    lmdb_backend_close(lmdb);
     free(isam_path);
     return 0;
 }

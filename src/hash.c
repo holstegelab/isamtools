@@ -1,7 +1,7 @@
 #include "common.h"
 
 int64_t qname_hash(const char *qname) {
-    /* FNV-1a 64-bit -> bit-cast to int64 for SQLite INTEGER storage. */
+    /* FNV-1a 64-bit -> bit-cast to int64. */
     uint64_t h = 0xcbf29ce484222325ULL;
     for (const unsigned char *p = (const unsigned char *)qname; *p; ++p) {
         h ^= *p;

@@ -4,18 +4,9 @@
 #include "common.h"
 #include "store.h"
 
-typedef enum view_backend_kind {
-    VIEW_BACKEND_SQLITE = 0,
-    VIEW_BACKEND_LMDB = 1
-} view_backend_kind_t;
-
 typedef struct view {
     char       *path;
-    view_backend_kind_t backend_kind;
-    sqlite3    *db;
-#ifdef ISAM_ENABLE_LMDB
     lmdb_backend_t *lmdb;
-#endif
     sam_hdr_t  *hdr;            /* alignment-view header (from meta) */
     int         n_targets;
     /* tid->name not stored; we use sam_hdr_tid2name via hdr */
@@ -27,7 +18,6 @@ view_t *view_open_read(const char *path);
 
 /* Open or create a view file for writing. Applies VIEW_DDL on create. */
 view_t *view_open_write(const char *path);
-view_t *view_open_write_backend(const char *path, view_backend_kind_t backend);
 
 void    view_close(view_t *v);
 

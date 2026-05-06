@@ -27,24 +27,6 @@ static size_t bam_payload_bytes(const bam1_t *b) {
     return b ? sizeof *b + (size_t)b->m_data : 0;
 }
 
-static void fill_record_from_stmt(sqlite3_stmt *s, store_record_t *out) {
-    memset(out, 0, sizeof *out);
-    out->read_id     = sqlite3_column_int64(s, 0);
-    const unsigned char *q = sqlite3_column_text(s, 1);
-    out->qname       = xstrdup(q ? (const char *)q : "");
-    out->tid         = sqlite3_column_type (s, 2) == SQLITE_NULL
-                       ? -1 : sqlite3_column_int(s, 2);
-    out->pos0        = sqlite3_column_type (s, 3) == SQLITE_NULL
-                       ? -1 : sqlite3_column_int64(s, 3);
-    out->end0        = sqlite3_column_type (s, 4) == SQLITE_NULL
-                       ? -1 : sqlite3_column_int64(s, 4);
-    out->flag        = sqlite3_column_int   (s, 5);
-    out->is_unmapped = sqlite3_column_int   (s, 6);
-    out->has_voffset = sqlite3_column_type  (s, 7) != SQLITE_NULL;
-    out->bam_voffset = out->has_voffset
-                       ? sqlite3_column_int64(s, 7) : -1;
-}
-
 store_t *store_open(const char *store_path, const char *index_path) {
     store_t *st = xcalloc(1, sizeof *st);
     st->store_path = xstrdup(store_path);
@@ -56,40 +38,12 @@ store_t *store_open(const char *store_path, const char *index_path) {
     if (S_ISDIR(idx_st.st_mode))
         die("store index '%s' is a directory; LMDB indexes are file-backed .isam files",
             index_path);
-    if (!isam_file_is_sqlite(index_path)) {
-#ifdef ISAM_ENABLE_LMDB
-        st->backend_kind = STORE_BACKEND_LMDB;
-        st->lmdb = lmdb_backend_open(index_path, /*readonly*/1, 0);
-        char *type = lmdb_backend_meta_get(st->lmdb, "isam_type");
-        if (!type || strcmp(type, "store") != 0)
-            die("'%s' is not an LMDB store index (type=%s)",
-                index_path, type ? type : "<missing>");
-        free(type);
-#else
-        die("'%s' is an LMDB store index, but this build has no LMDB support",
-            index_path);
-#endif
-    } else {
-        st->backend_kind = STORE_BACKEND_SQLITE;
-        st->db = db_open(index_path, SQLITE_OPEN_READONLY);
-
-        char *type = meta_get(st->db, "isam_type");
-        if (!type || strcmp(type, "store") != 0)
-            die("'%s' is not a store index (.isam type=%s)",
-                index_path, type ? type : "<missing>");
-        free(type);
-
-        st->q_lookup = db_prep(st->db,
-            "SELECT read_id, qname, tid, pos0, end0, flag, is_unmapped, "
-            "       bam_voffset, physical_hint_valid "
-            "FROM canonical_read "
-            "WHERE qname_hash=? AND qname=? LIMIT 1;");
-        st->id_lookup = db_prep(st->db,
-            "SELECT read_id, qname, tid, pos0, end0, flag, is_unmapped, "
-            "       bam_voffset, physical_hint_valid "
-            "FROM canonical_read "
-            "WHERE read_id=? LIMIT 1;");
-    }
+    st->lmdb = lmdb_backend_open(index_path, /*readonly*/1, 0);
+    char *type = lmdb_backend_meta_get(st->lmdb, "isam_type");
+    if (!type || strcmp(type, "store") != 0)
+        die("'%s' is not an LMDB store index (type=%s)",
+            index_path, type ? type : "<missing>");
+    free(type);
 
     st->sam = sam_open(store_path, "r");
     if (!st->sam) die("cannot open canonical store '%s'", store_path);
@@ -104,14 +58,9 @@ store_t *store_open(const char *store_path, const char *index_path) {
 
 void store_close(store_t *st) {
     if (!st) return;
-    if (st->q_lookup) sqlite3_finalize(st->q_lookup);
-    if (st->id_lookup) sqlite3_finalize(st->id_lookup);
-#ifdef ISAM_ENABLE_LMDB
     if (st->lmdb) lmdb_backend_close(st->lmdb);
-#endif
     if (st->hdr)      sam_hdr_destroy(st->hdr);
     if (st->sam)      sam_close(st->sam);
-    if (st->db)       db_close(st->db);
     free(st->store_path);
     free(st->index_path);
     free(st);
@@ -119,84 +68,38 @@ void store_close(store_t *st) {
 
 int store_has_name_index(store_t *st) {
     int64_t indexed_name = 0;
-    if (st->backend_kind == STORE_BACKEND_SQLITE)
-        return meta_get_i64(st->db, "indexed_name", &indexed_name) && indexed_name;
-#ifdef ISAM_ENABLE_LMDB
-    if (st->backend_kind == STORE_BACKEND_LMDB)
-        return lmdb_backend_meta_get_i64(st->lmdb, "indexed_name", &indexed_name) &&
-               indexed_name;
-#endif
-    return 0;
+    return lmdb_backend_meta_get_i64(st->lmdb, "indexed_name", &indexed_name) &&
+           indexed_name;
+}
+
+static void fill_record_from_lmdb(lmdb_store_record_t *lr, store_record_t *out) {
+    memset(out, 0, sizeof *out);
+    out->read_id = lr->read_id;
+    out->qname = xstrdup(lr->qname);
+    out->tid = lr->tid;
+    out->pos0 = lr->pos0;
+    out->end0 = lr->end0;
+    out->flag = lr->flag;
+    out->is_unmapped = lr->is_unmapped;
+    out->bam_voffset = lr->bam_voffset;
+    out->has_voffset = lr->has_voffset;
 }
 
 int store_lookup_qname(store_t *st, const char *qname, store_record_t *out) {
-    if (st->backend_kind == STORE_BACKEND_LMDB) {
-#ifdef ISAM_ENABLE_LMDB
-        lmdb_store_record_t lr;
-        if (!lmdb_store_lookup_qname(st->lmdb, qname_hash(qname), qname, &lr))
-            return 0;
-        memset(out, 0, sizeof *out);
-        out->read_id = lr.read_id;
-        out->qname = xstrdup(lr.qname);
-        out->tid = lr.tid;
-        out->pos0 = lr.pos0;
-        out->end0 = lr.end0;
-        out->flag = lr.flag;
-        out->is_unmapped = lr.is_unmapped;
-        out->bam_voffset = lr.bam_voffset;
-        out->has_voffset = lr.has_voffset;
-        lmdb_store_record_clear(&lr);
-        return 1;
-#else
+    lmdb_store_record_t lr;
+    if (!lmdb_store_lookup_qname(st->lmdb, qname_hash(qname), qname, &lr))
         return 0;
-#endif
-    }
-
-    sqlite3_reset(st->q_lookup);
-    sqlite3_bind_int64(st->q_lookup, 1, qname_hash(qname));
-    sqlite3_bind_text (st->q_lookup, 2, qname, -1, SQLITE_STATIC);
-
-    int rc = sqlite3_step(st->q_lookup);
-    if (rc == SQLITE_DONE) return 0;
-    if (rc != SQLITE_ROW)
-        die("store lookup failed: %s", sqlite3_errmsg(st->db));
-
-    fill_record_from_stmt(st->q_lookup, out);
+    fill_record_from_lmdb(&lr, out);
+    lmdb_store_record_clear(&lr);
     return 1;
 }
 
 int store_lookup_read_id(store_t *st, int64_t read_id, store_record_t *out) {
-    if (st->backend_kind == STORE_BACKEND_LMDB) {
-#ifdef ISAM_ENABLE_LMDB
-        lmdb_store_record_t lr;
-        if (!lmdb_store_lookup_read_id(st->lmdb, read_id, &lr))
-            return 0;
-        memset(out, 0, sizeof *out);
-        out->read_id = lr.read_id;
-        out->qname = xstrdup(lr.qname);
-        out->tid = lr.tid;
-        out->pos0 = lr.pos0;
-        out->end0 = lr.end0;
-        out->flag = lr.flag;
-        out->is_unmapped = lr.is_unmapped;
-        out->bam_voffset = lr.bam_voffset;
-        out->has_voffset = lr.has_voffset;
-        lmdb_store_record_clear(&lr);
-        return 1;
-#else
+    lmdb_store_record_t lr;
+    if (!lmdb_store_lookup_read_id(st->lmdb, read_id, &lr))
         return 0;
-#endif
-    }
-
-    sqlite3_reset(st->id_lookup);
-    sqlite3_bind_int64(st->id_lookup, 1, read_id);
-
-    int rc = sqlite3_step(st->id_lookup);
-    if (rc == SQLITE_DONE) return 0;
-    if (rc != SQLITE_ROW)
-        die("store read_id lookup failed: %s", sqlite3_errmsg(st->db));
-
-    fill_record_from_stmt(st->id_lookup, out);
+    fill_record_from_lmdb(&lr, out);
+    lmdb_store_record_clear(&lr);
     return 1;
 }
 

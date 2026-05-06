@@ -25,7 +25,7 @@ extern "C" {
 #define ISAM_OK                  0
 #define ISAM_EOF                -1
 #define ISAM_ERR_IO             -2
-#define ISAM_ERR_SQLITE         -3
+#define ISAM_ERR_BACKEND        -3
 #define ISAM_ERR_FORMAT         -4
 #define ISAM_ERR_MISSING_STORE  -5
 #define ISAM_ERR_MISSING_QNAME  -6

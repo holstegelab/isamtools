@@ -51,18 +51,6 @@ char *isam_index_path_for(const char *store_path) {
     return r;
 }
 
-int isam_file_is_sqlite(const char *path) {
-    unsigned char magic[16];
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    size_t n = fread(magic, 1, sizeof magic, f);
-    fclose(f);
-    static const unsigned char sqlite_magic[16] = {
-        'S','Q','L','i','t','e',' ','f','o','r','m','a','t',' ','3','\0'
-    };
-    return n == sizeof magic && memcmp(magic, sqlite_magic, sizeof magic) == 0;
-}
-
 char *now_iso8601(void) {
     char buf[40];
     time_t t = time(NULL);

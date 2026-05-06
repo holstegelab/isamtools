@@ -1,8 +1,6 @@
 #ifndef ISAM_BACKEND_LMDB_H
 #define ISAM_BACKEND_LMDB_H
 
-#ifdef ISAM_ENABLE_LMDB
-
 #include <stdint.h>
 #include <stddef.h>
 #include <lmdb.h>
@@ -21,6 +19,11 @@ typedef struct lmdb_backend {
     MDB_dbi aln_unmapped;
     MDB_dbi aln_by_read;
     MDB_dbi aln_by_bin;
+    MDB_dbi aln_checkpoint;
+    MDB_dbi subset_by_name;
+    MDB_dbi subset_read;
+    MDB_dbi read_tag;
+    MDB_dbi annotation_meta;
     char *path;
     int readonly;
 } lmdb_backend_t;
@@ -61,7 +64,9 @@ typedef enum lmdb_view_iter_kind {
     LMDB_VIEW_ITER_IMPORT = 0,
     LMDB_VIEW_ITER_COORD = 1,
     LMDB_VIEW_ITER_NAME = 2,
-    LMDB_VIEW_ITER_REGION = 3
+    LMDB_VIEW_ITER_REGION = 3,
+    LMDB_VIEW_ITER_READ_ID = 4,
+    LMDB_VIEW_ITER_SUBSET = 5
 } lmdb_view_iter_kind_t;
 
 typedef struct lmdb_view_iter lmdb_view_iter_t;
@@ -121,16 +126,49 @@ void            lmdb_view_index_record(lmdb_backend_t *b,
                                        const lmdb_view_record_t *rec,
                                        int index_coord,
                                        int index_interval);
+void            lmdb_view_build_checkpoints(lmdb_backend_t *b,
+                                            int64_t checkpoint_step);
+int64_t         lmdb_subset_upsert(lmdb_backend_t *b,
+                                   const char *name,
+                                   const char *description);
+int             lmdb_subset_lookup(lmdb_backend_t *b,
+                                   const char *name,
+                                   int64_t *subset_id);
+void            lmdb_subset_add_read(lmdb_backend_t *b,
+                                     int64_t subset_id,
+                                     int64_t read_id);
+int             lmdb_subset_contains_read(lmdb_backend_t *b,
+                                          int64_t subset_id,
+                                          int64_t read_id);
+void            lmdb_read_tag_put(lmdb_backend_t *b,
+                                  int64_t read_id,
+                                  const char *tag,
+                                  const char *type,
+                                  const void *value,
+                                  size_t value_len,
+                                  const char *source);
+void            lmdb_annotation_meta_put(lmdb_backend_t *b,
+                                         const char *kind,
+                                         const char *source,
+                                         const char *command_line);
+void            lmdb_view_rehint(lmdb_backend_t *view,
+                                 lmdb_backend_t *store,
+                                 const char *store_path,
+                                 const char *store_index_path,
+                                 int64_t *n_reads,
+                                 int64_t *n_changed);
 lmdb_view_iter_t *lmdb_view_iter_open(lmdb_backend_t *b,
                                       lmdb_view_iter_kind_t kind,
                                       int tid,
                                       int64_t beg,
                                       int64_t end);
+lmdb_view_iter_t *lmdb_view_iter_open_read_id(lmdb_backend_t *b,
+                                              int64_t store_read_id);
+lmdb_view_iter_t *lmdb_view_iter_open_subset(lmdb_backend_t *b,
+                                             int64_t subset_id);
 int             lmdb_view_iter_next(lmdb_view_iter_t *it,
                                     lmdb_view_record_t *out);
 void            lmdb_view_iter_close(lmdb_view_iter_t *it);
 void            lmdb_view_record_clear(lmdb_view_record_t *rec);
-
-#endif
 
 #endif
