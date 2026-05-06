@@ -48,7 +48,10 @@ static int record_to_bam(isamFile *fp,
                      rec->mate_tid, rec->mate_pos0, rec->tlen,
                      rec->aux, rec->aux_len);
     store_record_clear(&srec);
-    return ISAM_OK;
+    /* Match htslib: positive on success (b->l_data is the record's serialized
+     * size, always > 0 for any non-empty record). Consumers that test `> 0`
+     * (a common idiom) work without modification. */
+    return b->l_data > 0 ? b->l_data : 1;
 }
 
 isamFile *isam_open(const char *path, const char *mode) {

@@ -75,18 +75,19 @@ static int bed_interval_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static void bed_filter_add(bed_filter_t *bed, int tid,
+static void bed_filter_add(bed_filter_t *bed_filter, int tid,
                            int64_t beg, int64_t end) {
     if (end <= beg) return;
-    if (bed->n == bed->cap) {
-        bed->cap = bed->cap ? bed->cap * 2 : 128;
-        bed->items = xrealloc(bed->items, bed->cap * sizeof *bed->items);
+    if (bed_filter->n == bed_filter->cap) {
+        bed_filter->cap = bed_filter->cap ? bed_filter->cap * 2 : 128;
+        bed_filter->items = xrealloc(bed_filter->items,
+                                     bed_filter->cap * sizeof *bed_filter->items);
     }
-    bed->items[bed->n++] = (bed_interval_t){ tid, beg, end };
+    bed_filter->items[bed_filter->n++] = (bed_interval_t){ tid, beg, end };
 }
 
 static bed_filter_t bed_filter_load(const char *path, sam_hdr_t *hdr) {
-    bed_filter_t bed = { 0 };
+    bed_filter_t bed_filter = { 0 };
     FILE *fp = fopen(path, "r");
     if (!fp) die("cannot open BED file '%s': %s", path, strerror(errno));
     char *line = NULL;
@@ -114,26 +115,27 @@ static bed_filter_t bed_filter_load(const char *path, sam_hdr_t *hdr) {
         if (tid < 0)
             die("BED reference '%s' on line %lld is absent from the view header",
                 chrom, (long long)line_no);
-        bed_filter_add(&bed, tid, beg, end);
+        bed_filter_add(&bed_filter, tid, beg, end);
     }
     free(line);
     fclose(fp);
-    qsort(bed.items, bed.n, sizeof *bed.items, bed_interval_cmp);
-    return bed;
+    qsort(bed_filter.items, bed_filter.n, sizeof *bed_filter.items,
+          bed_interval_cmp);
+    return bed_filter;
 }
 
-static void bed_filter_destroy(bed_filter_t *bed) {
-    free(bed->items);
-    memset(bed, 0, sizeof *bed);
+static void bed_filter_destroy(bed_filter_t *bed_filter) {
+    free(bed_filter->items);
+    memset(bed_filter, 0, sizeof *bed_filter);
 }
 
-static int overlaps_bed(const bed_filter_t *bed,
+static int overlaps_bed(const bed_filter_t *bed_filter,
                         int tid, int64_t beg, int64_t end) {
-    if (!bed) return 1;
-    if (bed->n == 0) return 0;
+    if (!bed_filter) return 1;
+    if (bed_filter->n == 0) return 0;
     if (tid < 0 || beg < 0 || end <= beg) return 0;
-    for (size_t i = 0; i < bed->n; ++i) {
-        const bed_interval_t *iv = &bed->items[i];
+    for (size_t i = 0; i < bed_filter->n; ++i) {
+        const bed_interval_t *iv = &bed_filter->items[i];
         if (iv->tid < tid) continue;
         if (iv->tid > tid) return 0;
         if (iv->beg >= end) return 0;
@@ -180,10 +182,10 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                             payload_cache_t *cache,
                             bam1_t *canon_buf, bam1_t *out_buf,
                             const view_filter_t *filter,
-                            const bed_filter_t *bed,
+                            const bed_filter_t *bed_filter,
                             int count_only) {
     if (!passes_filter(filter, rec->flag, rec->mapq)) return 0;
-    if (!overlaps_bed(bed, rec->tid, rec->pos0, rec->end0)) return 0;
+    if (!overlaps_bed(bed_filter, rec->tid, rec->pos0, rec->end0)) return 0;
     if (count_only) return 1;
 
     store_record_t srec;
@@ -285,8 +287,8 @@ int cmd_view(int argc, char **argv) {
 
     view_t *v = view_open_read(isam_path);
     view_link_store(v, store_override, store_idx_override);
-    bed_filter_t bed = { 0 };
-    if (bed_path) bed = bed_filter_load(bed_path, v->hdr);
+    bed_filter_t bed_filter = { 0 };
+    if (bed_path) bed_filter = bed_filter_load(bed_path, v->hdr);
     if (reference_path &&
         hts_set_fai_filename(v->store->sam, reference_path) != 0)
         die("cannot set reference FASTA '%s'", reference_path);
@@ -313,7 +315,7 @@ int cmd_view(int argc, char **argv) {
         if (sam_hdr_write(out, v->hdr) < 0) die("sam_hdr_write failed");
     }
     if (header_only) {
-        bed_filter_destroy(&bed);
+        bed_filter_destroy(&bed_filter);
         sam_close(out);
         view_close(v);
         return 0;
@@ -352,7 +354,7 @@ int cmd_view(int argc, char **argv) {
             }
             n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                        canon, outb, &filter,
-                                       bed_path ? &bed : NULL, count_only);
+                                       bed_path ? &bed_filter : NULL, count_only);
             lmdb_view_record_clear(&rec);
         }
         lmdb_view_iter_close(it);
@@ -363,10 +365,10 @@ int cmd_view(int argc, char **argv) {
             die("alignment view has no LMDB interval index; "
                 "run `isamtools sort --interval %s`", isam_path);
         seen_aln_ids_t seen = { 0 };
-        for (size_t i = 0; i < bed.n; ++i) {
-            int iv_tid = bed.items[i].tid;
-            int64_t iv_beg = bed.items[i].beg;
-            int64_t iv_end = bed.items[i].end;
+        for (size_t i = 0; i < bed_filter.n; ++i) {
+            int iv_tid = bed_filter.items[i].tid;
+            int64_t iv_beg = bed_filter.items[i].beg;
+            int64_t iv_end = bed_filter.items[i].end;
             if (region) {
                 if (iv_tid != tid || iv_end <= beg || iv_beg >= end)
                     continue;
@@ -380,7 +382,7 @@ int cmd_view(int argc, char **argv) {
             while (lmdb_view_iter_next(it, &rec)) {
                 if (!seen_aln_id(&seen, rec.aln_id))
                     n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
-                                               canon, outb, &filter, &bed,
+                                               canon, outb, &filter, &bed_filter,
                                                count_only);
                 lmdb_view_record_clear(&rec);
             }
@@ -405,14 +407,14 @@ int cmd_view(int argc, char **argv) {
         while (lmdb_view_iter_next(it, &rec)) {
             n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                        canon, outb, &filter,
-                                       bed_path ? &bed : NULL, count_only);
+                                       bed_path ? &bed_filter : NULL, count_only);
             lmdb_view_record_clear(&rec);
         }
         lmdb_view_iter_close(it);
     }
 
     if (count_only) fprintf(stdout, "%lld\n", (long long)n_emit);
-    bed_filter_destroy(&bed);
+    bed_filter_destroy(&bed_filter);
     payload_cache_destroy(cache);
     bam_destroy1(canon);
     bam_destroy1(outb);

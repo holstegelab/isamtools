@@ -65,7 +65,10 @@ set(ISAM_SOURCES
     src/cmd_update.c
     src/cmd_rehint.c
     src/api.c
+    src/htsisam_dispatch.c
 )
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(isam STATIC ${ISAM_SOURCES})
 target_include_directories(isam
@@ -77,5 +80,19 @@ target_link_libraries(isam PUBLIC PkgConfig::HTSLIB lmdb_static)
 add_executable(isamtools src/main.c)
 target_link_libraries(isamtools PRIVATE isam)
 
+# Drop-in compat shared library for htslib consumers. Re-compiles the same
+# isam sources (including htsisam_dispatch.c) into a self-contained .so so
+# downstream packages just need `-lhtsisam -lhts`. Visibility is controlled
+# by ISAM_EXPORT / explicit `extern` declarations on htsisam_*.
+add_library(htsisam SHARED ${ISAM_SOURCES} $<TARGET_OBJECTS:lmdb_static>)
+target_include_directories(htsisam
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${LMDB_SOURCE_DIR}
+)
+target_link_libraries(htsisam PUBLIC PkgConfig::HTSLIB)
+set_target_properties(htsisam PROPERTIES C_VISIBILITY_PRESET default)
+
 install(TARGETS isamtools RUNTIME DESTINATION bin)
+install(TARGETS htsisam   LIBRARY DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)

@@ -49,6 +49,7 @@ isamtools sort --all sample.hg38.isam
 - `update`: mutate metadata paths and aliases.
 
 Detailed command docs live in [docs/commands](docs/commands).
+Storage-layout and command-path details live in [docs/data-structures.md](docs/data-structures.md).
 
 ## Identity Model
 
@@ -95,37 +96,49 @@ isamtools sort --all sample.hg38.isam
 
 ## Build
 
-```bash
-cmake -S . -B build \
-  -DISAM_LMDB_SOURCE_DIR=/path/to/openldap/libraries/liblmdb
-cmake --build build
-```
-
-Dependencies:
-
-- htslib
-- LMDB source (`mdb.c` and `midl.c`)
-- samtools for the shell tests
-
-### LMDB Source
-
-LMDB is statically compiled into `libisam.a` from source:
+The repository now builds with the top-level `Makefile`.
 
 ```bash
-cmake -S . -B build-lmdb \
-  -DISAM_LMDB_SOURCE_DIR=/path/to/openldap/libraries/liblmdb
-cmake --build build-lmdb
+make
 ```
 
-When network access is explicitly available, CMake can fetch the source:
+This build downloads release tarballs for htslib and LMDB into `build/vendor`,
+builds local static libraries, and links `build/isamtools` against those local
+copies. The resulting binary includes `libhts.a` and `liblmdb.a` directly; it
+does not depend on system-installed shared copies of either library.
+
+Build requirements:
+
+- `cc`
+- `make`
+- `curl` or `wget`
+- `tar`
+- development headers for `zlib`, `libbz2`, and `liblzma`
+- `samtools` for the shell tests
+
+The default htslib configuration disables libcurl, plugins, S3/GCS support, and
+libdeflate to keep the static link surface small and predictable.
+
+Useful targets:
 
 ```bash
-cmake -S . -B build-lmdb \
-  -DISAM_LMDB_FETCH=ON
+make
+make test
+make clean
+make distclean
 ```
 
-The fetch path is deliberately opt-in so ordinary builds do not depend on
-network access.
+Useful overrides:
+
+```bash
+make BUILD_DIR=out
+make HTSLIB_VERSION=1.22.2
+make HTSLIB_CONFIGURE_FLAGS='--disable-libcurl --disable-plugins --disable-s3 --disable-gcs --without-libdeflate'
+```
+
+`make clean` removes `build/isamtools`, `build/libisam.a`, and the project
+object files. `make distclean` removes the entire build tree, including the
+downloaded dependency sources and installed static libraries.
 
 ## Tests
 
@@ -137,6 +150,9 @@ tests/lmdb_alignment.sh
 tests/lmdb_compat.sh
 N=50000 tests/profile_small.sh
 ```
+
+The test scripts default to `build/isamtools`. Override `TOOL=/path/to/isamtools`
+when needed.
 
 The tests use tiny synthetic or subset fixtures and avoid the large files under
 `data/`.

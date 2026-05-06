@@ -9,6 +9,9 @@ Include:
 #include <isam/isam.h>
 ```
 
+When linking statically against `libisam.a`, also link the matching local
+static copies of htslib and LMDB used to build it.
+
 ## Opening
 
 ```c
