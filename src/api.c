@@ -3,6 +3,7 @@
 #include "view.h"
 #include "store.h"
 #include "rebuild.h"
+#include "aux_tags.h"
 
 #include <htslib/hts.h>
 
@@ -11,6 +12,8 @@ struct isamFile {
     lmdb_view_iter_t *seq_lmdb;
     bam1_t       *canon;
     payload_cache_t *cache;
+    isam_tag_set_t shared_tags;
+    isam_tag_set_t dropped_tags;
     int           errcode;
 };
 
@@ -47,6 +50,12 @@ static int record_to_bam(isamFile *fp,
                      rec->pos0, rec->mapq, rec->n_cigar, rec->cigar,
                      rec->mate_tid, rec->mate_pos0, rec->tlen,
                      rec->aux, rec->aux_len);
+    lmdb_read_tags_apply(fp->v->lmdb, rec->store_read_id, b, 0);
+    isam_aux_tags_append_missing_from(fp->canon, b,
+                                      &fp->shared_tags,
+                                      &fp->dropped_tags);
+    lmdb_read_tags_apply(fp->v->store->lmdb, rec->store_read_id, b, 0);
+    isam_aux_tags_remove(b, &fp->dropped_tags);
     store_record_clear(&srec);
     /* Match htslib: positive on success (b->l_data is the record's serialized
      * size, always > 0 for any non-empty record). Consumers that test `> 0`
@@ -76,6 +85,19 @@ isamFile *isam_open_ext(const char *path, const char *mode,
         hts_set_threads(fp->v->store->sam, opts->n_threads);
     fp->canon = bam_init1();
     fp->cache = payload_cache_create(opts ? opts->payload_cache_bytes : 0);
+    isam_tag_set_init(&fp->shared_tags);
+    isam_tag_set_init(&fp->dropped_tags);
+    char *shared_csv = view_meta_get(fp->v, "shared_tags_snapshot");
+    char *dropped_csv = view_meta_get(fp->v, "dropped_tags");
+    if (isam_tag_set_parse_csv(&fp->shared_tags, shared_csv) != 0 ||
+        isam_tag_set_parse_csv(&fp->dropped_tags, dropped_csv) != 0) {
+        free(shared_csv);
+        free(dropped_csv);
+        isam_close(fp);
+        return NULL;
+    }
+    free(shared_csv);
+    free(dropped_csv);
     return fp;
 }
 
@@ -84,6 +106,8 @@ int isam_close(isamFile *fp) {
     if (fp->seq_lmdb) lmdb_view_iter_close(fp->seq_lmdb);
     if (fp->canon)    bam_destroy1(fp->canon);
     if (fp->cache)    payload_cache_destroy(fp->cache);
+    isam_tag_set_destroy(&fp->shared_tags);
+    isam_tag_set_destroy(&fp->dropped_tags);
     if (fp->v)        view_close(fp->v);
     free(fp);
     return 0;

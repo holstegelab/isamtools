@@ -1,144 +1,171 @@
 # isamtools
 
-`isamtools` stores one canonical BAM/CRAM read-payload store and many compact
-`.isam` alignment views. LMDB is the storage backend. The tool is intended for samples
-aligned repeatedly to different references or aligner settings, where
-duplicating SEQ/QUAL and invariant read payload in every BAM/CRAM is wasteful.
+When a sample is aligned to multiple references (e.g. hg38 and CHM13) or
+re-aligned under different aligner settings, every resulting BAM file contains
+the same read sequences and base qualities duplicated in full. For long-read
+data especially, this redundancy is substantial. `isamtools` eliminates it.
 
-The canonical store keeps QNAME, SEQ, QUAL, and canonical-location hints. Each
-alignment view stores alignment-specific fields such as FLAG, TID, POS, MAPQ,
-CIGAR, mate fields, and aux tags. `isamtools view` reconstructs SAM/BAM records
-by combining the view with the canonical payload.
+**One canonical BAM/CRAM. Many lightweight alignment views.**
 
-## Core Workflow
+Existing htslib-based tools (assemblers, variant callers, …) can read `.isam`
+files directly via a thin compatibility shim — in most cases with no source
+changes at all. See [docs/htslib-compat-migration.md](docs/htslib-compat-migration.md).
+
+`isamtools index` builds a compact LMDB index (`.isam`) over the first
+(canonical) BAM/CRAM, recording QNAME, placement hints, and a BGZF virtual
+offset into the BAM for each read. The original BAM/CRAM is kept and remains
+the source of SEQ/QUAL — nothing is re-encoded in LMDB.
+
+Every subsequent alignment is imported with `isamtools import`, which stores
+only the alignment-specific fields (FLAG, POS, CIGAR, MAPQ, aux tags, …) in a
+second `.isam` view file. That secondary BAM/CRAM can then be deleted.
+`isamtools view` reconstructs full SAM/BAM records on the fly by reading
+alignment data from the view and fetching the canonical payload from the
+original BAM/CRAM via the stored offset.
+
+## Quick start
 
 ```bash
+# Build once (downloads and statically links htslib + LMDB, and vendors bzip2)
+make
+
+# 1. Index the canonical store (keeps sample.chm13.bam; builds sample.chm13.isam)
 isamtools index sample.chm13.bam
 
-isamtools import sample.hg38.bam \
-  --store sample.chm13.bam \
-  --aln sample.hg38.isam
 
+# 2. Import a second alignment — only alignment fields are stored, not SEQ/QUAL
+isamtools import sample.hg38.bam --store sample.chm13.bam
+# creates sample.hg38.isam. sample.hg38.bam can now be deleted; 
+
+# 3. Build coordinate / name / interval indexes on the view
 isamtools sort --all sample.hg38.isam
 
+# 4. Query as you would a BAM
 isamtools view sample.hg38.isam chr1:1000000-2000000
 ```
 
-The canonical store index and alignment view are file-backed LMDB `.isam`
-databases:
+Output is standard SAM/BAM, compatible with any downstream htslib-based tool.
+
+## Annotations and subsets
+
+### Adding per-read tags
+
+Canonical tags that should be shared across imported views can be selected at
+index time. Source-specific read-wide tags such as haplotype assignment `HP`
+and phase set `PS` are carried by imports and stored once per read.
+
+Share canonical tags at index time:
 
 ```bash
-isamtools index -o sample.chm13.bam.isam sample.chm13.bam
-
-isamtools import sample.hg38.bam \
-  --store sample.chm13.bam \
-  --store-index sample.chm13.bam.isam \
-  --aln sample.hg38.isam
-
-isamtools sort --all sample.hg38.isam
+isamtools index sample.chm13.bam --share-tags RX,MM,ML
 ```
+
+Or annotate an existing store or view after the fact with a TSV (`QNAME\tTAG:TYPE:VALUE`):
+
+```bash
+# tags.tsv example:
+# m64367e_220930_224746/18876851/ccs  HP:i:1  PS:i:100200
+# m64367e_220930_224746/97978955/ccs  HP:i:2  PS:i:100200
+isamtools annotate sample.chm13.bam --from tags.tsv
+```
+
+Use `audit-tags` to preview how tags in your BAM will be classified before
+indexing:
+
+```bash
+isamtools audit-tags sample.chm13.bam
+```
+
+### Named subsets
+
+A subset is a named list of QNAMEs stored inside the `.isam`. `view --subset`
+checks the alignment view first and then falls back to the canonical store, so
+store-level subsets can be reused across multiple views.
+
+```bash
+# Store a list of HiFi read names as the "hifi" subset
+isamtools annotate sample.chm13.bam --subset hifi --from hifi.qnames.txt
+
+# Query only HiFi reads from any alignment view
+isamtools view --subset hifi sample.hg38.isam chr1:1000000-2000000
+isamtools view --subset hifi sample.chm13.isam
+```
+
+Store-level subsets cover all linked views; view-local subsets still work too.
+
+## When to use isamtools
+
+- A sample is aligned to two or more references.
+- A sample is re-aligned after parameter tuning, and you want to keep both
+  alignments without storing two full copies of the read data.
+- You want to attach per-read annotations (tags, QNAME subsets) that are
+  shared across all alignments of the same reads.
+
+A single `isamtools import` step replaces a secondary BAM with a view that
+stores only the alignment-specific fields — no SEQ/QUAL, no duplicate payload.
+The canonical BAM/CRAM is kept as the single source of read data.
 
 ## Commands
 
-- `index`: build or rebuild a canonical store index.
-- `import`: import an alternate alignment into a standalone `.isam` view.
-- `sort`: build logical coordinate/name/interval indexes.
-- `view`: reconstruct SAM/BAM records from an alignment view.
-- `annotate`: add read tags or named QNAME subsets.
-- `rehint`: rewrite stale `store_read_id` values after a store-index rebuild.
-- `update`: mutate metadata paths and aliases.
+| Command | Purpose |
+|---------|---------|
+| `index` | Build or rebuild a canonical store index from a BAM/CRAM. |
+| `import` | Import an alternate alignment as a lightweight `.isam` view. |
+| `check` | Verify BAM/CRAM/SAM content against a store or view. |
+| `sort` | Build coordinate, name, and/or interval indexes on a view. |
+| `view` | Reconstruct SAM/BAM records from a view (streaming or region query). |
+| `annotate` | Add per-read tags or named QNAME subsets. |
+| `audit-tags` | Report how aux tags in a file will be classified (shared, carried, alignment, or unknown). |
+| `rehint` | Repair `store_read_id` references after a store index rebuild. |
+| `update` | Edit metadata paths and aliases inside an `.isam` file. |
 
-Detailed command docs live in [docs/commands](docs/commands).
-Storage-layout and command-path details live in [docs/data-structures.md](docs/data-structures.md).
+**Aux tag classification.** `index --share-tags TAG1,TAG2,...` adds tags to the
+canonical shared set, while `index --no-share-tags TAG1,TAG2,...` removes tags
+from sharing. `import --carry-tags`, `--keep-alignment-tags`, `--drop-tags`,
+and `--drop-source-tags` tune how source tags are stored for one imported view.
+Use `audit-tags` to preview the classification before indexing or importing.
 
-## Identity Model
+Detailed per-command documentation: [docs/commands/](docs/commands/).  
+Storage layout and internal design: [docs/data-structures.md](docs/data-structures.md).
 
-The canonical store index uses `canonical_read.read_id` as the integer identity
-for a read. Alignment views mirror that ID in `read_dict.store_read_id`, while
-preserving QNAME so the mapping can be repaired.
+## Using `.isam` files with existing htslib programs
 
-If the store index is rebuilt and read IDs change, run:
+`libisam` ships a thin compatibility shim that intercepts a small set of
+htslib entry points (`hts_open`, `sam_read1`, `sam_itr_querys`, …) and
+dispatches to the ISAM backend when the path ends in `.isam`. In the simplest
+case (Path A), you add one compile flag and swap the link libraries — **no
+source changes required**.
 
-```bash
-isamtools rehint sample.hg38.isam
-```
-
-Every QNAME in the view must still exist in the target store index. Missing
-QNAMEs are reported as errors.
-
-## Hard Clipping Policy
-
-The view CIGAR is authoritative. If a view record has hard clipping and its
-CIGAR query length differs from the canonical SEQ length, reconstruction trims
-SEQ/QUAL only when the leading/trailing hard clips exactly explain the
-difference. Otherwise `view` reports an incompatible CIGAR/payload error.
-
-This is important because BAM requires SEQ length to equal the query-consuming
-CIGAR length excluding hard clips.
-
-## Performance Notes
-
-View reconstruction fetches canonical payloads by integer `store_read_id` and
-uses an in-memory payload cache. Repeated alignments for the same read, such as
-secondary and supplementary records, avoid redundant payload decoding.
-
-For region queries, build the interval index:
-
-```bash
-isamtools sort --interval sample.hg38.isam
-```
-
-For full coordinate/name scans, build all indexes:
-
-```bash
-isamtools sort --all sample.hg38.isam
-```
+See [docs/htslib-compat-migration.md](docs/htslib-compat-migration.md) for the
+three migration paths (compile-time `-include`, single header swap, or explicit
+`htsisam_*` calls) and a worked example for the `otter` assembler.
 
 ## Build
 
-The repository now builds with the top-level `Makefile`.
-
 ```bash
 make
+make packages      # fetch/build vendored third-party static libs only
 ```
 
-This build downloads release tarballs for htslib and LMDB into `build/vendor`,
-builds local static libraries, and links `build/isamtools` against those local
-copies. The resulting binary includes `libhts.a` and `liblmdb.a` directly; it
-does not depend on system-installed shared copies of either library.
+Downloads htslib, LMDB, and bzip2 into `build/vendor`, builds static
+libraries, and links `build/isamtools`. The binary has no runtime dependency on
+system-installed htslib, LMDB, or libbz2.
 
-Build requirements:
-
-- `cc`
-- `make`
-- `curl` or `wget`
-- `tar`
-- development headers for `zlib`, `libbz2`, and `liblzma`
-- `samtools` for the shell tests
-
-The default htslib configuration disables libcurl, plugins, S3/GCS support, and
-libdeflate to keep the static link surface small and predictable.
-
-Useful targets:
+Requirements: `cc`, `make`, `curl` or `wget`, `tar`, and development headers
+for `zlib` and `liblzma`. `samtools` is needed only to run the shell tests.
 
 ```bash
-make
-make test
-make clean
-make distclean
+make test          # run functional tests
+make clean         # remove build artifacts (keeps downloaded sources)
+make distclean     # remove entire build tree including vendor sources
 ```
 
-Useful overrides:
+Overrides:
 
 ```bash
 make BUILD_DIR=out
 make HTSLIB_VERSION=1.22.2
-make HTSLIB_CONFIGURE_FLAGS='--disable-libcurl --disable-plugins --disable-s3 --disable-gcs --without-libdeflate'
 ```
-
-`make clean` removes `build/isamtools`, `build/libisam.a`, and the project
-object files. `make distclean` removes the entire build tree, including the
-downloaded dependency sources and installed static libraries.
 
 ## Tests
 
@@ -148,16 +175,31 @@ tests/smoke.sh
 tests/lmdb_store.sh
 tests/lmdb_alignment.sh
 tests/lmdb_compat.sh
-N=50000 tests/profile_small.sh
 ```
 
-The test scripts default to `build/isamtools`. Override `TOOL=/path/to/isamtools`
-when needed.
+Tests use small fixtures under `test_data/`. Override the binary with
+`TOOL=/path/to/isamtools` if needed.
 
-The tests use tiny synthetic or subset fixtures and avoid the large files under
-`data/`.
+For private, machine-local validation and profiling against the large files in
+`data/`, use the opt-in scripts:
+
+```bash
+N=10000 tests/private_data_validate.sh
+N=100000 tests/profile_private_data.sh
+```
 
 ## C API
 
-The public C API returns htslib-native `sam_hdr_t` and `bam1_t` objects. See
-[docs/api.md](docs/api.md).
+The public C API returns htslib-native `sam_hdr_t` and `bam1_t` objects, so it
+slots into any existing htslib-based pipeline. See [docs/api.md](docs/api.md).
+
+## Identity and repair
+
+Each read is assigned a stable integer `read_id` in the canonical store.
+Alignment views reference that ID as `store_read_id`. If the store is
+recreated or re-indexed and IDs change, repair all dependent views with:
+
+```bash
+isamtools index sample.hg38.new.cram
+isamtools rehint sample.hg38.isam --store sample.hg38.new.cram
+```

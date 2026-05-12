@@ -59,6 +59,7 @@ set(ISAM_SOURCES
     src/view.c
     src/cmd_index.c
     src/cmd_import.c
+    src/cmd_check.c
     src/cmd_sort.c
     src/cmd_view.c
     src/cmd_annotate.c

@@ -61,7 +61,8 @@ included, `sam_open`, `sam_read1`, etc. are `#define`d to the wrapping
 /path/to/isamtools/build/libisam.a       \
 /path/to/isamtools/build/vendor/htslib/lib/libhts.a   \
 /path/to/isamtools/build/vendor/lmdb/lib/liblmdb.a    \
--lz -lbz2 -llzma -lpthread -lm
+/path/to/isamtools/build/vendor/bzip2/lib/libbz2.a    \
+-lz -llzma -lpthread -lm
 ```
 
 The vendored static archives in the isamtools build are not built with
@@ -131,7 +132,8 @@ EXE_LDFLAGS = -no-pie
 LINK_LIBS   = $(ISAM_BUILD)/libisam.a                          \
               $(ISAM_BUILD)/vendor/htslib/lib/libhts.a         \
               $(ISAM_BUILD)/vendor/lmdb/lib/liblmdb.a          \
-              -lwfacpp -lz -lbz2 -llzma -lpthread -lm -fopenmp
+              $(ISAM_BUILD)/vendor/bzip2/lib/libbz2.a          \
+              -lwfacpp -lz -llzma -lpthread -lm -fopenmp
 
 $(ODIR)/%.o: $(SDIR)/%.cpp | $(ODIR)
 	$(CXX) $(CXX_FLAGS) $(HTSISAM_CPPFLAGS) -MMD -MP -c -o $@ $< $(INC)

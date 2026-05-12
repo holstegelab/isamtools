@@ -93,6 +93,8 @@ void            lmdb_store_put_meta_i64(lmdb_backend_t *b,
                                         int64_t value);
 void            lmdb_store_put_record(lmdb_backend_t *b,
                                       const lmdb_store_record_t *rec);
+void            lmdb_store_update_record(lmdb_backend_t *b,
+                                         const lmdb_store_record_t *rec);
 int             lmdb_store_lookup_qname(lmdb_backend_t *b,
                                         int64_t qname_hash,
                                         const char *qname,
@@ -134,7 +136,7 @@ int64_t         lmdb_subset_upsert(lmdb_backend_t *b,
 int             lmdb_subset_lookup(lmdb_backend_t *b,
                                    const char *name,
                                    int64_t *subset_id);
-void            lmdb_subset_add_read(lmdb_backend_t *b,
+int             lmdb_subset_add_read(lmdb_backend_t *b,
                                      int64_t subset_id,
                                      int64_t read_id);
 int             lmdb_subset_contains_read(lmdb_backend_t *b,
@@ -147,6 +149,17 @@ void            lmdb_read_tag_put(lmdb_backend_t *b,
                                   const void *value,
                                   size_t value_len,
                                   const char *source);
+int             lmdb_read_tag_get(lmdb_backend_t *b,
+                                  int64_t read_id,
+                                  const char *tag,
+                                  char *type,
+                                  uint8_t **value,
+                                  size_t *value_len);
+void            lmdb_read_tags_apply(lmdb_backend_t *b,
+                                     int64_t read_id,
+                                     bam1_t *record,
+                                     int overwrite_existing);
+int64_t         lmdb_store_count_supplementary_records(lmdb_backend_t *b);
 void            lmdb_annotation_meta_put(lmdb_backend_t *b,
                                          const char *kind,
                                          const char *source,

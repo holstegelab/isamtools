@@ -112,8 +112,8 @@ void store_record_clear(store_record_t *rec) {
 /* Fetch payload by BGZF voffset (BAM only). */
 static int fetch_bam_voffset(store_t *st, const char *qname,
                              int64_t voffset, bam1_t *out) {
-    BGZF *bgzf = st->sam->fp.bgzf;
-    if (bgzf_seek(bgzf, voffset, SEEK_SET) < 0)
+    BGZF *bgzf_fp = st->sam->fp.bgzf;
+    if (bgzf_seek(bgzf_fp, voffset, SEEK_SET) < 0)
         die("bgzf_seek to voffset %lld failed in '%s'",
             (long long)voffset, st->store_path);
     int rc = sam_read1(st->sam, st->hdr, out);

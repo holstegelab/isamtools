@@ -21,6 +21,14 @@ static int cigar_query_len(int n_cigar, const uint32_t *cigar,
     return qlen;
 }
 
+static int cigar_has_hard_clip(int n_cigar, const uint32_t *cigar) {
+    for (int i = 0; i < n_cigar; ++i) {
+        if (bam_cigar_op(cigar[i]) == BAM_CHARD_CLIP)
+            return 1;
+    }
+    return 0;
+}
+
 static hts_pos_t cigar_ref_span(int n_cigar, const uint32_t *cigar) {
     hts_pos_t span = 0;
     for (int i = 0; i < n_cigar; ++i) {
@@ -43,6 +51,11 @@ void isam_rebuild_bam(bam1_t *out, const bam1_t *canonical,
                       int n_cigar, const uint32_t *cigar,
                       int mtid, int64_t mpos, int64_t isize,
                       const uint8_t *aux, int aux_len) {
+    if (cigar_has_hard_clip(canonical->core.n_cigar, bam_get_cigar(canonical)))
+        die("canonical store record '%s' has hard clipping; "
+            "re-index from an unclipped primary alignment",
+            bam_get_qname(canonical));
+
     int leading_hclip = 0, trailing_hclip = 0;
     int cigar_qlen = cigar_query_len(n_cigar, cigar,
                                      &leading_hclip, &trailing_hclip);

@@ -43,11 +43,26 @@ char *xstrdup(const char *s) {
     return r;
 }
 
+static int has_path_suffix(const char *path, const char *suffix) {
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    return path_len >= suffix_len &&
+           strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
 char *isam_index_path_for(const char *store_path) {
-    size_t n = strlen(store_path);
-    char *r = xmalloc(n + 6);
-    memcpy(r, store_path, n);
-    memcpy(r + n, ".isam", 6);
+    size_t stem_len = strlen(store_path);
+    if (has_path_suffix(store_path, ".bam")) {
+        stem_len -= 4;
+    } else if (has_path_suffix(store_path, ".cram")) {
+        stem_len -= 5;
+    } else if (has_path_suffix(store_path, ".sam")) {
+        stem_len -= 4;
+    }
+
+    char *r = xmalloc(stem_len + 6);
+    memcpy(r, store_path, stem_len);
+    memcpy(r + stem_len, ".isam", 6);
     return r;
 }
 

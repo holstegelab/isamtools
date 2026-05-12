@@ -260,6 +260,19 @@ static void decode_record(MDB_val *val, lmdb_store_record_t *out) {
     (void)get_u32(&p);
 }
 
+static int decode_record_flag(const MDB_val *val) {
+    const unsigned char *p = val->mv_data;
+    const unsigned char *end = p + val->mv_size;
+    if (p >= end || *p++ != 1) die("unsupported lmdb canonical record version");
+    uint16_t qn = get_u16(&p);
+    if (p + qn > end) die("truncated lmdb canonical record");
+    p += qn;
+    if (p + 8 + 8 + 4 + 8 + 8 + 4 > end)
+        die("truncated lmdb canonical record");
+    p += 8 + 8 + 4 + 8 + 8;
+    return (int32_t)get_u32(&p);
+}
+
 static MDB_val encode_view_read(int64_t store_read_id,
                                 const char *qname,
                                 int64_t hash) {
@@ -341,6 +354,143 @@ static MDB_val encode_read_tag_value(const char *type,
     if (sn) memcpy(p, source, sn);
     MDB_val val = { n, buf };
     return val;
+}
+
+static void decode_read_tag_value(const MDB_val *val,
+                                  char *type,
+                                  const void **value,
+                                  size_t *value_len) {
+    const unsigned char *p = val->mv_data;
+    const unsigned char *end = p + val->mv_size;
+    if (p >= end || *p++ != 1 || p + 1 + 4 > end)
+        die("corrupt lmdb read_tag value");
+    *type = (char)*p++;
+    uint32_t raw_len = get_u32(&p);
+    if (p + raw_len + 2 > end)
+        die("corrupt lmdb read_tag value");
+    *value = p;
+    *value_len = raw_len;
+}
+
+static uint16_t get_le16(const unsigned char *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t get_le32(const unsigned char *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int aux_array_item_size(uint8_t type) {
+    switch (type) {
+    case 'c': case 'C': return 1;
+    case 's': case 'S': return 2;
+    case 'i': case 'I': case 'f': return 4;
+    default: return -1;
+    }
+}
+
+static char *copy_text_value(const void *value, size_t value_len) {
+    char *text = xmalloc(value_len + 1);
+    memcpy(text, value, value_len);
+    text[value_len] = 0;
+    return text;
+}
+
+static int64_t read_tag_int_value(char type, const void *value, size_t value_len) {
+    const unsigned char *raw = value;
+    switch (type) {
+    case 'c': if (value_len == 1) return (int8_t)raw[0]; break;
+    case 'C': if (value_len == 1) return raw[0]; break;
+    case 's': if (value_len == 2) return (int16_t)get_le16(raw); break;
+    case 'S': if (value_len == 2) return get_le16(raw); break;
+    case 'i': if (value_len == 4) return (int32_t)get_le32(raw); break;
+    case 'I': if (value_len == 4) return get_le32(raw); break;
+    default: break;
+    }
+
+    char *text = copy_text_value(value, value_len);
+    char *end = NULL;
+    long long parsed = strtoll(text, &end, 10);
+    if (!text[0] || (end && *end))
+        die("invalid integer read_tag value '%s'", text);
+    free(text);
+    return (int64_t)parsed;
+}
+
+static float read_tag_float_value(const void *value, size_t value_len) {
+    if (value_len == 4) {
+        union {
+            uint32_t u32;
+            float f;
+        } bits = { .u32 = get_le32((const unsigned char *)value) };
+        return bits.f;
+    }
+
+    char *text = copy_text_value(value, value_len);
+    char *end = NULL;
+    double parsed = strtod(text, &end);
+    if (!text[0] || (end && *end))
+        die("invalid float read_tag value '%s'", text);
+    free(text);
+    return (float)parsed;
+}
+
+static void append_read_tag_value(bam1_t *record,
+                                  const char tag[2],
+                                  char type,
+                                  const void *value,
+                                  size_t value_len) {
+    if (type == 'A') {
+        if (value_len == 0)
+            die("invalid empty character read_tag '%s'", tag);
+        if (bam_aux_append(record, tag, type, 1, value) != 0)
+            die("failed to append aux tag '%s'", tag);
+        return;
+    }
+    if (type == 'Z' || type == 'H') {
+        const unsigned char *raw = value;
+        if (value_len > 0 && raw[value_len - 1] == 0) {
+            if (bam_aux_append(record, tag, type, (int)value_len, value) != 0)
+                die("failed to append aux tag '%s'", tag);
+        } else {
+            char *text = copy_text_value(value, value_len);
+            if (bam_aux_append(record, tag, type, (int)value_len + 1,
+                               (const uint8_t *)text) != 0)
+                die("failed to append aux tag '%s'", tag);
+            free(text);
+        }
+        return;
+    }
+    if (type == 'c' || type == 'C' || type == 's' || type == 'S' ||
+        type == 'i' || type == 'I') {
+        if (bam_aux_update_int(record, tag, read_tag_int_value(type, value, value_len)) != 0)
+            die("failed to append aux tag '%s'", tag);
+        return;
+    }
+    if (type == 'f') {
+        if (bam_aux_update_float(record, tag, read_tag_float_value(value, value_len)) != 0)
+            die("failed to append aux tag '%s'", tag);
+        return;
+    }
+    if (type == 'B') {
+        const unsigned char *raw = value;
+        if (value_len < 5)
+            die("invalid array read_tag '%s'", tag);
+        int item_size = aux_array_item_size(raw[0]);
+        uint32_t item_count = get_le32(raw + 1);
+        size_t expected = 1 + 4 + (size_t)item_count * item_size;
+        if (item_size < 0 || expected != value_len)
+            die("unsupported array read_tag '%s'", tag);
+        if (bam_aux_update_array(record, tag, raw[0], item_count, (void *)(raw + 5)) != 0)
+            die("failed to append aux tag '%s'", tag);
+        return;
+    }
+    if (type == 'd')
+        die("unsupported double-precision read_tag '%s'", tag);
+    die("unsupported read_tag type '%c' for '%s'", type, tag);
 }
 
 static MDB_val encode_annotation_meta_value(const char *kind,
@@ -466,7 +616,7 @@ lmdb_backend_t *lmdb_backend_open(const char *path, int readonly,
                                             : (size_t)64 * 1024 * 1024 * 1024);
     if (rc) lmdb_die(rc, "env_set_mapsize", path);
 
-    int flags = MDB_NOSUBDIR | (readonly ? MDB_RDONLY : 0);
+    int flags = MDB_NOSUBDIR | MDB_NOTLS | (readonly ? MDB_RDONLY : 0);
     rc = mdb_env_open(b->env, path, flags, 0664);
     if (rc) lmdb_die(rc, "env_open", path);
 
@@ -654,6 +804,31 @@ void lmdb_store_put_record(lmdb_backend_t *b,
     put_u64(&p, (uint64_t)rec->read_id);
     MDB_val ridval = { sizeof ridbuf, ridbuf };
     rc = mdb_put(txn, b->canonical_by_qname, &qkey, &ridval, MDB_NOOVERWRITE);
+    if (rc) lmdb_die(rc, "put(canonical_by_qname)", b->path);
+
+    free(val.mv_data);
+    free(qkey.mv_data);
+    write_txn_finish(b, txn, owned);
+}
+
+void lmdb_store_update_record(lmdb_backend_t *b,
+                              const lmdb_store_record_t *rec) {
+    int owned = 0;
+    MDB_txn *txn = write_txn(b, &owned);
+
+    unsigned char idbuf[8];
+    be64_key(rec->read_id, idbuf);
+    MDB_val idkey = { sizeof idbuf, idbuf };
+    MDB_val val = encode_record(rec);
+    int rc = mdb_put(txn, b->canonical_by_id, &idkey, &val, 0);
+    if (rc) lmdb_die(rc, "put(canonical_by_id)", b->path);
+
+    MDB_val qkey = qname_key(rec->qname_hash, rec->qname);
+    unsigned char ridbuf[8];
+    unsigned char *p = ridbuf;
+    put_u64(&p, (uint64_t)rec->read_id);
+    MDB_val ridval = { sizeof ridbuf, ridbuf };
+    rc = mdb_put(txn, b->canonical_by_qname, &qkey, &ridval, 0);
     if (rc) lmdb_die(rc, "put(canonical_by_qname)", b->path);
 
     free(val.mv_data);
@@ -1014,9 +1189,9 @@ int lmdb_subset_lookup(lmdb_backend_t *b,
     return 1;
 }
 
-void lmdb_subset_add_read(lmdb_backend_t *b,
-                          int64_t subset_id,
-                          int64_t read_id) {
+int lmdb_subset_add_read(lmdb_backend_t *b,
+                         int64_t subset_id,
+                         int64_t read_id) {
     int owned = 0;
     MDB_txn *txn = write_txn(b, &owned);
     MDB_val key = subset_read_key(subset_id, read_id);
@@ -1025,6 +1200,7 @@ void lmdb_subset_add_read(lmdb_backend_t *b,
     if (rc && rc != MDB_KEYEXIST) lmdb_die(rc, "put(subset_read)", b->path);
     free(key.mv_data);
     write_txn_finish(b, txn, owned);
+    return rc == 0;
 }
 
 int lmdb_subset_contains_read(lmdb_backend_t *b,
@@ -1059,6 +1235,119 @@ void lmdb_read_tag_put(lmdb_backend_t *b,
     free(key.mv_data);
     free(val.mv_data);
     write_txn_finish(b, txn, owned);
+}
+
+int lmdb_read_tag_get(lmdb_backend_t *b,
+                      int64_t read_id,
+                      const char *tag,
+                      char *type,
+                      uint8_t **value,
+                      size_t *value_len) {
+    MDB_txn *txn = b->write_txn;
+    int owned = 0;
+    if (!txn) {
+        int rc = mdb_txn_begin(b->env, NULL, MDB_RDONLY, &txn);
+        if (rc) lmdb_die(rc, "txn_begin", b->path);
+        owned = 1;
+    }
+
+    MDB_val key = read_tag_key(read_id, tag);
+    MDB_val val = { 0, NULL };
+    int rc = mdb_get(txn, b->read_tag, &key, &val);
+    free(key.mv_data);
+    if (rc == MDB_NOTFOUND) {
+        if (owned) mdb_txn_abort(txn);
+        return 0;
+    }
+    if (rc) lmdb_die(rc, "get(read_tag)", b->path);
+
+    const void *raw_value = NULL;
+    size_t raw_len = 0;
+    decode_read_tag_value(&val, type, &raw_value, &raw_len);
+    *value = xmalloc(raw_len ? raw_len : 1);
+    if (raw_len) memcpy(*value, raw_value, raw_len);
+    *value_len = raw_len;
+
+    if (owned) mdb_txn_abort(txn);
+    return 1;
+}
+
+void lmdb_read_tags_apply(lmdb_backend_t *b,
+                          int64_t read_id,
+                          bam1_t *record,
+                          int overwrite_existing) {
+    MDB_txn *txn = NULL;
+    MDB_cursor *cursor = NULL;
+    int rc = mdb_txn_begin(b->env, NULL, MDB_RDONLY, &txn);
+    if (rc) lmdb_die(rc, "txn_begin", b->path);
+    rc = mdb_cursor_open(txn, b->read_tag, &cursor);
+    if (rc) lmdb_die(rc, "cursor_open(read_tag)", b->path);
+
+    unsigned char seek_buf[10];
+    unsigned char *p = seek_buf;
+    put_u64(&p, (uint64_t)read_id);
+    *p++ = 0;
+    *p++ = 0;
+    MDB_val key = { sizeof seek_buf, seek_buf };
+    MDB_val val = { 0, NULL };
+    rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+    while (rc == 0) {
+        int64_t row_read_id = 0;
+        char tag[3];
+        read_tag_key_parts(&key, &row_read_id, tag);
+        if (row_read_id != read_id) {
+            rc = MDB_NOTFOUND;
+            break;
+        }
+
+        char type = 0;
+        const void *value = NULL;
+        size_t value_len = 0;
+        decode_read_tag_value(&val, &type, &value, &value_len);
+
+        uint8_t *existing = bam_aux_get(record, tag);
+        if (existing) {
+            if (!overwrite_existing) {
+                rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+                continue;
+            }
+            if (bam_aux_del(record, existing) != 0)
+                die("failed to replace aux tag '%s'", tag);
+        }
+        append_read_tag_value(record, tag, type, value, value_len);
+
+        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    }
+    if (rc != MDB_NOTFOUND)
+        lmdb_die(rc, "cursor_get(read_tag)", b->path);
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+}
+
+int64_t lmdb_store_count_supplementary_records(lmdb_backend_t *b) {
+    MDB_txn *txn = NULL;
+    MDB_cursor *cursor = NULL;
+    int rc = mdb_txn_begin(b->env, NULL, MDB_RDONLY, &txn);
+    if (rc) lmdb_die(rc, "txn_begin", b->path);
+    rc = mdb_cursor_open(txn, b->canonical_by_id, &cursor);
+    if (rc) lmdb_die(rc, "cursor_open(canonical_by_id)", b->path);
+
+    MDB_val key = { 0, NULL };
+    MDB_val val = { 0, NULL };
+    int64_t n = 0;
+    rc = mdb_cursor_get(cursor, &key, &val, MDB_FIRST);
+    while (rc == 0) {
+        if (decode_record_flag(&val) & BAM_FSUPPLEMENTARY)
+            ++n;
+        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    }
+    if (rc != MDB_NOTFOUND)
+        lmdb_die(rc, "cursor_get(canonical_by_id)", b->path);
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+    return n;
 }
 
 void lmdb_annotation_meta_put(lmdb_backend_t *b,

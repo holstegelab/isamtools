@@ -22,7 +22,7 @@ char *xstrdup(const char *s);
 /* qname hash: FNV-1a 64, returned as int64 (bit-cast). */
 int64_t qname_hash(const char *qname);
 
-/* path helper: append .isam to a path. caller frees. */
+/* path helper: replace trailing .bam/.cram/.sam with .isam, else append .isam. caller frees. */
 char *isam_index_path_for(const char *store_path);
 
 /* iso8601 utc timestamp, malloc'd */

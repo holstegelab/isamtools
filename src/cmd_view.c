@@ -2,6 +2,7 @@
 #include "view.h"
 #include "store.h"
 #include "rebuild.h"
+#include "aux_tags.h"
 #include "../include/isam/isam.h"
 
 #include <htslib/hts.h>
@@ -29,7 +30,7 @@ static void usage(void) {
         "  -@, --threads N  Worker threads for htslib I/O.\n"
         "  -L, --targets-file P  BED file of regions to emit.\n"
         "      --order ORD  full-scan order: coordinate (default) or name.\n"
-        "      --subset S   Only emit reads in named view subset.\n"
+        "      --subset S   Only emit reads in named subset (view first, then store).\n"
         "  -f INT           Require all FLAG bits in INT.\n"
         "  -F INT           Exclude records with any FLAG bits in INT.\n"
         "      --rf INT     Require at least one FLAG bit in INT.\n"
@@ -39,6 +40,12 @@ static void usage(void) {
         "  -o, --output P   Output file (default stdout).\n"
         "  --help           Show this help.\n",
         stderr);
+}
+
+static int subset_contains(view_t *v, int subset_from_store,
+                           int64_t subset_id, int64_t store_read_id) {
+    return lmdb_subset_contains_read(subset_from_store ? v->store->lmdb : v->lmdb,
+                                     subset_id, store_read_id);
 }
 
 typedef struct view_filter {
@@ -183,6 +190,8 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                             bam1_t *canon_buf, bam1_t *out_buf,
                             const view_filter_t *filter,
                             const bed_filter_t *bed_filter,
+                            const isam_tag_set_t *shared_tags,
+                            const isam_tag_set_t *dropped_tags,
                             int count_only) {
     if (!passes_filter(filter, rec->flag, rec->mapq)) return 0;
     if (!overlaps_bed(bed_filter, rec->tid, rec->pos0, rec->end0)) return 0;
@@ -200,6 +209,10 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                      rec->n_cigar, rec->cigar,
                      rec->mate_tid, rec->mate_pos0, rec->tlen,
                      rec->aux, rec->aux_len);
+    lmdb_read_tags_apply(v->lmdb, rec->store_read_id, out_buf, 0);
+    isam_aux_tags_append_missing_from(canon_buf, out_buf, shared_tags, dropped_tags);
+    lmdb_read_tags_apply(v->store->lmdb, rec->store_read_id, out_buf, 0);
+    isam_aux_tags_remove(out_buf, dropped_tags);
     store_record_clear(&srec);
 
     if (sam_write1(out_sam, hdr, out_buf) < 0)
@@ -296,11 +309,17 @@ int cmd_view(int argc, char **argv) {
         hts_set_threads(v->store->sam, n_threads) != 0)
         die("cannot set store threads to %d", n_threads);
     int have_subset = 0;
+    int subset_from_store = 0;
     int64_t subset_id = 0;
     if (subset) {
-        if (!lmdb_subset_lookup(v->lmdb, subset, &subset_id))
-            die("subset '%s' is empty or absent in view", subset);
-        have_subset = 1;
+        if (lmdb_subset_lookup(v->lmdb, subset, &subset_id)) {
+            have_subset = 1;
+        } else if (lmdb_subset_lookup(v->store->lmdb, subset, &subset_id)) {
+            have_subset = 1;
+            subset_from_store = 1;
+        } else {
+            die("subset '%s' is empty or absent in both view and store", subset);
+        }
     }
 
     /* Open output. */
@@ -324,6 +343,18 @@ int cmd_view(int argc, char **argv) {
     bam1_t *canon = bam_init1();
     bam1_t *outb  = bam_init1();
     payload_cache_t *cache = payload_cache_create(64 * 1024 * 1024);
+    isam_tag_set_t shared_tags;
+    isam_tag_set_t dropped_tags;
+    isam_tag_set_init(&shared_tags);
+    isam_tag_set_init(&dropped_tags);
+    char *shared_csv = view_meta_get(v, "shared_tags_snapshot");
+    char *dropped_csv = view_meta_get(v, "dropped_tags");
+    if (isam_tag_set_parse_csv(&shared_tags, shared_csv) != 0)
+        die("invalid shared tag metadata in '%s'", isam_path);
+    if (isam_tag_set_parse_csv(&dropped_tags, dropped_csv) != 0)
+        die("invalid dropped tag metadata in '%s'", isam_path);
+    free(shared_csv);
+    free(dropped_csv);
     int64_t n_emit = 0;
 
     lmdb_view_iter_kind_t iter_kind = LMDB_VIEW_ITER_IMPORT;
@@ -344,7 +375,7 @@ int cmd_view(int argc, char **argv) {
         iter_kind = LMDB_VIEW_ITER_REGION;
     }
 
-    if (have_subset && (bed_path || region)) {
+    if (have_subset && !subset_from_store && (bed_path || region)) {
         lmdb_view_iter_t *it = lmdb_view_iter_open_subset(v->lmdb, subset_id);
         lmdb_view_record_t rec;
         while (lmdb_view_iter_next(it, &rec)) {
@@ -354,7 +385,8 @@ int cmd_view(int argc, char **argv) {
             }
             n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                        canon, outb, &filter,
-                                       bed_path ? &bed_filter : NULL, count_only);
+                                       bed_path ? &bed_filter : NULL,
+                                       &shared_tags, &dropped_tags, count_only);
             lmdb_view_record_clear(&rec);
         }
         lmdb_view_iter_close(it);
@@ -380,9 +412,16 @@ int cmd_view(int argc, char **argv) {
                                                        iv_tid, iv_beg, iv_end);
             lmdb_view_record_t rec;
             while (lmdb_view_iter_next(it, &rec)) {
+                if (have_subset && subset_from_store &&
+                    !subset_contains(v, subset_from_store, subset_id,
+                                     rec.store_read_id)) {
+                    lmdb_view_record_clear(&rec);
+                    continue;
+                }
                 if (!seen_aln_id(&seen, rec.aln_id))
                     n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                                canon, outb, &filter, &bed_filter,
+                                               &shared_tags, &dropped_tags,
                                                count_only);
                 lmdb_view_record_clear(&rec);
             }
@@ -390,7 +429,7 @@ int cmd_view(int argc, char **argv) {
         }
         seen_aln_ids_destroy(&seen);
     } else {
-        if (!region && have_subset) {
+        if (!region && have_subset && !subset_from_store) {
             iter_kind = LMDB_VIEW_ITER_SUBSET;
         } else if (!region && strcasecmp(order, "name") == 0) {
             iter_kind = LMDB_VIEW_ITER_NAME;
@@ -401,13 +440,22 @@ int cmd_view(int argc, char **argv) {
         }
 
         lmdb_view_iter_t *it = have_subset && !region
-            ? lmdb_view_iter_open_subset(v->lmdb, subset_id)
+            ? (subset_from_store
+                ? lmdb_view_iter_open(v->lmdb, iter_kind, tid, beg, end)
+                : lmdb_view_iter_open_subset(v->lmdb, subset_id))
             : lmdb_view_iter_open(v->lmdb, iter_kind, tid, beg, end);
         lmdb_view_record_t rec;
         while (lmdb_view_iter_next(it, &rec)) {
+            if (have_subset && subset_from_store &&
+                !subset_contains(v, subset_from_store, subset_id,
+                                 rec.store_read_id)) {
+                lmdb_view_record_clear(&rec);
+                continue;
+            }
             n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                        canon, outb, &filter,
-                                       bed_path ? &bed_filter : NULL, count_only);
+                                       bed_path ? &bed_filter : NULL,
+                                       &shared_tags, &dropped_tags, count_only);
             lmdb_view_record_clear(&rec);
         }
         lmdb_view_iter_close(it);
@@ -416,6 +464,8 @@ int cmd_view(int argc, char **argv) {
     if (count_only) fprintf(stdout, "%lld\n", (long long)n_emit);
     bed_filter_destroy(&bed_filter);
     payload_cache_destroy(cache);
+    isam_tag_set_destroy(&shared_tags);
+    isam_tag_set_destroy(&dropped_tags);
     bam_destroy1(canon);
     bam_destroy1(outb);
     sam_close(out);

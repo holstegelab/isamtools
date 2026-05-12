@@ -19,7 +19,7 @@ isamtools view [options] <view.isam> [region]
 - `-@, --threads N`: htslib I/O threads.
 - `-L, --targets-file PATH`: BED file of target intervals.
 - `--order coordinate|name`: full-scan order.
-- `--subset NAME`: emit only reads in a view subset.
+- `--subset NAME`: emit only reads in a named subset, searching the alignment view first and then the canonical store.
 - `-f INT`: require all FLAG bits.
 - `-F INT`: exclude records with any FLAG bits.
 - `--rf INT`: require at least one FLAG bit.
@@ -30,14 +30,16 @@ isamtools view [options] <view.isam> [region]
 
 LMDB alignment views support full scans, name-ordered scans, filters, counts,
 BED filtering, and region queries after `isamtools sort --interval` or
-`--all`. Named subsets are implemented for LMDB views.
+`--all`. Named subsets are searched in the alignment view first and then in the
+linked canonical store.
 
 ## Hard Clipping
 
-The view CIGAR is authoritative. If hard clips make the view query length
-shorter than the canonical payload, `view` trims canonical SEQ/QUAL only when
-the CIGAR hard clips exactly account for the difference. Other length
-mismatches are errors.
+Primary canonical reads in the store must not be hard-clipped. Hard clipping is
+allowed in alignment views. The view CIGAR is authoritative; if hard clips make
+the view query length shorter than the canonical payload, `view` trims
+canonical SEQ/QUAL only when the hard clips exactly account for the difference.
+Other length mismatches are errors.
 
 ## Examples
 

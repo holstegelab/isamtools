@@ -9,6 +9,9 @@ and the execution path taken by the main commands:
 - `annotate`
 - `rehint`
 
+For the proposed tag ownership, fallback, and comparison model, see
+`docs/tag-policy-design.md`.
+
 The project is now LMDB-only. A `.isam` path is a file-backed LMDB environment
 opened with `MDB_NOSUBDIR`, and LMDB creates the sibling lock file
 `<path>-lock` while the environment exists.
@@ -28,7 +31,7 @@ the original BAM/CRAM.
 The broad rule is:
 
 - Store `.isam`: owns canonical read identity.
-- View `.isam`: owns per-alignment state and read-level annotations/subsets.
+- View `.isam`: owns per-alignment state and optional view-local read annotations/subsets.
 - `view`: reconstructs by reading the view, then fetching canonical payload from
   the store by `store_read_id`.
 
@@ -41,7 +44,9 @@ Important fields:
 - `env`: LMDB environment handle.
 - `write_txn`: active write transaction, when a command batches writes.
 - `meta`: metadata key/value DBI.
-- Store DBIs: `canonical_by_id`, `canonical_by_qname`.
+- Store DBIs: `canonical_by_id`, `canonical_by_qname`, plus optional
+  store-side annotation tables such as `read_tag`, `subset_by_name`,
+  `subset_read`, and `annotation_meta`.
 - View DBIs: `read_by_id`, `read_by_qname`, `aln_by_id`,
   `aln_import_by_order`, `aln_by_coord`, `aln_unmapped`, `aln_by_read`,
   `aln_checkpoint`, `subset_by_name`, `subset_read`, `read_tag`,
@@ -108,6 +113,14 @@ Canonical store indexes use:
 - `canonical_by_qname`
   - key: `(qname_hash, qname)`
   - value: 8-byte `read_id`
+
+Store `.isam` files may also carry post-index read-level annotations:
+
+- `read_tag`
+  - key: `(read_id, tag)`
+  - value: encoded tag type/value/source
+- `subset_by_name`, `subset_read`, `annotation_meta`
+  - used when `annotate` targets the store directly
 
 This gives two access paths:
 
@@ -237,13 +250,18 @@ Execution path:
 7. Skip secondary and supplementary records so one canonical identity is kept
    per read name.
 8. Assign `read_id = n_records + 1` in encounter order.
-9. Encode and insert the record into:
+9. Determine the effective read-level tag list from built-in tag lists, header
+  hints, and any `--read-level-tags` overrides.
+10. Encode and insert the record into:
    - `canonical_by_id`
    - `canonical_by_qname`
-10. Track `store_max_read_len` and, for BAM, record `bam_voffset` as a payload
+11. Store the effective read-level tag list in `meta`.
+12. Keep canonical aux tags in the original BAM/CRAM payload rather than
+  duplicating them into store LMDB.
+13. Track `store_max_read_len` and, for BAM, record `bam_voffset` as a payload
     hint.
-11. Periodically commit and reopen the write transaction for large inputs.
-12. Write final index metadata such as `indexed_name` and `indexed_coord`.
+14. Periodically commit and reopen the write transaction for large inputs.
+15. Write final index metadata such as `indexed_name` and `indexed_coord`.
 
 Why the two store indexes exist:
 
@@ -257,8 +275,10 @@ Canonical-store consequence:
   read, not at a supplementary alignment
 - this is intentional because supplementary records may be hard-clipped or
   otherwise unsuitable as the canonical payload source
-- the current implementation keeps the first non-secondary,
-  non-supplementary record encountered in the store input
+- the current implementation prefers a primary alignment and otherwise keeps a
+  non-hard-clipped supplementary alignment as the canonical payload source
+- canonical BAM/CRAM read-level tags stay in the canonical payload; store
+  `read_tag` is used only for later store-side annotations
 
 ### `import`
 
@@ -291,6 +311,10 @@ Execution path:
    - extract `qname`
    - look up the canonical read in `canonical_by_qname`
    - fail or skip if absent, depending on `--allow-missing`
+   - classify aux tags using the stored read-level tag list, the input header,
+     and any import-time overrides
+   - promote read-level tags into `read_tag`
+   - keep alignment-local and unknown tags in the inline aux blob
    - write a read identity entry into `read_by_id` and `read_by_qname`
    - encode the alignment into `aln_by_id`
    - add import-order and read fanout entries to:
@@ -310,11 +334,12 @@ Those are built later by `sort` so import stays append-oriented.
 
 Tag consequence during import:
 
-- alignment-local SAM tags are already captured during `import`
-- they are stored inline in each `lmdb_view_record_t` as the raw aux blob
-  `aux` plus `aux_len`
-- this means no separate `aln_tag` DBI is required for the current immutable
-  alignment-view model
+- read-level SAM tags live in `read_tag`
+- alignment-local SAM tags stay inline in each `lmdb_view_record_t` as the raw
+  aux blob `aux` plus `aux_len`
+- unknown tags default to alignment-level and are reported as warnings
+- this keeps the immutable alignment-view model while still letting
+  reconstruction merge read-level tags back into output
 
 ### `view` of a Region
 
@@ -355,8 +380,12 @@ Execution path for a plain region query:
     - resolve `store_read_id` in `canonical_by_id`
     - fetch canonical payload from BAM/CRAM, preferably via cached voffset
     - rebuild a fresh `bam1_t` with view-side alignment state
-  - append the stored view-side aux blob, which includes the
-    alignment-specific SAM tags imported from the source alignment file
+    - append the stored view-side aux blob, which includes the
+      alignment-specific SAM tags imported from the source alignment file
+    - merge view `read_tag` entries for the same `read_id`
+    - merge store `read_tag` entries for the same `read_id` when not already
+      present in the record; these are store-side annotations rather than a
+      duplicate copy of canonical BAM/CRAM tags
 12. Apply optional flag/MAPQ/BED filters and emit or count.
 
 Why this is structured as a two-stage lookup:
@@ -366,12 +395,16 @@ Why this is structured as a two-stage lookup:
 - Exact interval filtering happens after dereference so long-read overlap is
   correct even when scanning from an earlier safe start.
 
-Important current limitation:
+Important current behavior:
 
 - `view` rebuilds alignment-local tags from the inline `aln_by_id` aux blob
-- read-level annotations stored in `read_tag` by `annotate` are not yet merged
-  back into emitted SAM/BAM records
-- so today `read_tag` is persistent metadata, not part of reconstruction output
+- `read_tag` entries from the view are merged back into the emitted SAM/BAM
+  record during reconstruction
+- store `read_tag` entries are also merged back, but those are only later
+  store-side annotations; canonical BAM/CRAM tags already came from the fetched
+  payload
+- view-level read tags take precedence over store-level read tags when both are
+  present for the same `(read_id, tag)` pair
 
 Special cases layered onto the same base path:
 
@@ -423,13 +456,14 @@ Why annotations are read-level, not alignment-level:
 
 Store-side annotation status:
 
-- annotating a store `.isam` is already supported
+- annotating a store `.isam` is supported
 - `cmd_annotate` resolves qnames through `canonical_by_qname` when
   `isam_type=store`
 - this makes store-side subset and read-tag writes cheap
-- current consumer paths for `view` and subset iteration use the alignment view
-  DBIs, so store-side annotations are not automatically projected into every
-  view yet
+- reconstruction applies read tags from the alignment view first and then from
+  the store
+- `view --subset` searches the alignment view first and then falls back to the
+  store subset table
 
 ### `rehint`
 

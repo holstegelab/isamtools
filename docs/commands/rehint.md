@@ -28,5 +28,5 @@ isamtools rehint sample.hg38.isam
 
 isamtools rehint sample.hg38.isam \
   --store /new/sample.chm13.bam \
-  --store-index /new/sample.chm13.bam.isam
+  --store-index /new/sample.chm13.isam
 ```

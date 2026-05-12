@@ -1,6 +1,7 @@
 #include "common.h"
 #include "backend_lmdb.h"
 
+#include <htslib/hts.h>
 #include <getopt.h>
 
 static void usage(void) {
@@ -15,6 +16,7 @@ static void usage(void) {
         "Subset mode:\n"
         "  --subset NAME   Subset name to add reads to.\n"
         "  --from FILE     One QNAME per line.\n"
+        "  --from-bam FILE Stream QNAMEs from SAM/BAM/CRAM records.\n"
         "  --description S Optional subset description.\n"
         "\n"
         "Options:\n"
@@ -114,10 +116,11 @@ static void annotate_subset(lmdb_backend_t *lmdb, int is_store,
     int64_t subset_id = lmdb_subset_upsert(lmdb, subset_name, desc);
     char *line = NULL; size_t cap = 0;
     ssize_t n;
-    int64_t n_added = 0, n_missing = 0;
+    int64_t n_seen = 0, n_added = 0, n_existing = 0, n_missing = 0;
     while ((n = getline(&line, &cap, f)) >= 0) {
         rstrip(line);
         if (!*line || *line == '#') continue;
+        ++n_seen;
 
         int64_t id;
         if (!lookup_qname(lmdb, is_store, line, &id)) {
@@ -128,19 +131,77 @@ static void annotate_subset(lmdb_backend_t *lmdb, int is_store,
             continue;
         }
 
-        lmdb_subset_add_read(lmdb, subset_id, id);
-        ++n_added;
+        if (lmdb_subset_add_read(lmdb, subset_id, id))
+            ++n_added;
+        else
+            ++n_existing;
     }
     lmdb_annotation_meta_put(lmdb, "subset", path, cmdline);
     free(line);
     if (f != stdin) fclose(f);
 
-    fprintf(stderr, "isamtools annotate: subset '%s' += %lld qnames, %lld missing\n",
-            subset_name, (long long)n_added, (long long)n_missing);
+    fprintf(stderr,
+            "isamtools annotate: subset '%s' saw %lld qnames, added %lld new, %lld already present, %lld missing\n",
+            subset_name,
+            (long long)n_seen,
+            (long long)n_added,
+            (long long)n_existing,
+            (long long)n_missing);
+}
+
+static void annotate_subset_bam(lmdb_backend_t *lmdb, int is_store,
+                                const char *subset_name, const char *desc,
+                                const char *path, const char *cmdline,
+                                int allow_missing) {
+    samFile *input = sam_open(path, "r");
+    if (!input) die("cannot open '%s'", path);
+    sam_hdr_t *hdr = sam_hdr_read(input);
+    if (!hdr) die("cannot read header from '%s'", path);
+
+    int64_t subset_id = lmdb_subset_upsert(lmdb, subset_name, desc);
+    bam1_t *b = bam_init1();
+    int64_t n_records = 0, n_added = 0, n_existing = 0, n_missing = 0;
+    while (1) {
+        int rc = sam_read1(input, hdr, b);
+        if (rc == -1) break;
+        if (rc < -1)
+            die("error reading '%s' at record %lld", path, (long long)n_records);
+
+        const char *qname = bam_get_qname(b);
+        int64_t id;
+        if (!lookup_qname(lmdb, is_store, qname, &id)) {
+            if (!allow_missing)
+                die("annotate: qname '%s' not present in target "
+                    "(use --allow-missing to skip)", qname);
+            ++n_missing;
+            ++n_records;
+            continue;
+        }
+
+        if (lmdb_subset_add_read(lmdb, subset_id, id))
+            ++n_added;
+        else
+            ++n_existing;
+        ++n_records;
+    }
+
+    lmdb_annotation_meta_put(lmdb, "subset", path, cmdline);
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    sam_close(input);
+
+    fprintf(stderr,
+            "isamtools annotate: subset '%s' saw %lld records, added %lld new, %lld already present, %lld missing\n",
+            subset_name,
+            (long long)n_records,
+            (long long)n_added,
+            (long long)n_existing,
+            (long long)n_missing);
 }
 
 int cmd_annotate(int argc, char **argv) {
     const char *from   = NULL;
+    const char *from_bam = NULL;
     const char *subset = NULL;
     const char *desc   = NULL;
     int allow_missing  = 0;
@@ -150,6 +211,7 @@ int cmd_annotate(int argc, char **argv) {
         {"subset",        required_argument, 0, 1001},
         {"description",   required_argument, 0, 1002},
         {"allow-missing", no_argument,       0, 1003},
+        {"from-bam",      required_argument, 0, 1004},
         {"help",          no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -161,12 +223,16 @@ int cmd_annotate(int argc, char **argv) {
         case 1001: subset = optarg; break;
         case 1002: desc   = optarg; break;
         case 1003: allow_missing = 1; break;
+        case 1004: from_bam = optarg; break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
     }
     if (optind >= argc) { usage(); return 2; }
-    if (!from) die("--from is required");
+    if (!!from + !!from_bam != 1)
+        die("exactly one of --from or --from-bam is required");
+    if (from_bam && !subset)
+        die("--from-bam is only supported with --subset");
 
     char *isam_path = resolve_isam_path(argv[optind]);
     lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
@@ -185,9 +251,14 @@ int cmd_annotate(int argc, char **argv) {
                  "%s%s", i ? " " : "", argv[i]);
     }
 
-    if (subset) annotate_subset(lmdb, is_store, subset, desc, from, cmdbuf,
-                                allow_missing);
-    else        annotate_tags  (lmdb, is_store, from, cmdbuf, allow_missing);
+    if (subset && from_bam)
+        annotate_subset_bam(lmdb, is_store, subset, desc, from_bam, cmdbuf,
+                            allow_missing);
+    else if (subset)
+        annotate_subset(lmdb, is_store, subset, desc, from, cmdbuf,
+                        allow_missing);
+    else
+        annotate_tags(lmdb, is_store, from, cmdbuf, allow_missing);
 
     lmdb_backend_close(lmdb);
     free(isam_path);
