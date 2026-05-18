@@ -35,19 +35,26 @@ long_view_qual=$(printf '%*s' 500 '' | tr ' ' '!')
 {
     printf '@HD\tVN:1.6\tSO:unsorted\n'
     printf '@SQ\tSN:chrS\tLN:10000\n'
+    printf '@RG\tID:rg1\tLB:libA\n'
+    printf '@RG\tID:rg2\tLB:libB\n'
     printf 'qShort\t0\tchrS\t1\t60\t8M\t*\t0\t0\tACGTACGT\tFFFFFFFF\n'
     printf 'qLong\t0\tchrS\t10\t60\t500M\t*\t0\t0\t%s\t%s\n' \
         "$long_store_seq" "$long_store_qual"
     printf 'qOther\t0\tchrS\t800\t60\t8M\t*\t0\t0\tTTTTCCCC\tFFFFFFFF\n'
+    printf 'qPair\t0\tchrS\t900\t60\t8M\t*\t0\t0\tAAAACCCC\tFFFFFFFF\n'
 } > "$WORK/store.sam"
 
 {
     printf '@HD\tVN:1.6\tSO:unsorted\n'
     printf '@SQ\tSN:chrV\tLN:10000\n'
-    printf 'qShort\t0\tchrV\t100\t30\t8M\t*\t0\t0\tNNNNNNNN\t!!!!!!!!\n'
-    printf 'qLong\t0\tchrV\t1\t40\t500M\t*\t0\t0\t%s\t%s\n' \
+    printf '@RG\tID:rg1\tLB:libA\n'
+    printf '@RG\tID:rg2\tLB:libB\n'
+    printf 'qShort\t0\tchrV\t100\t30\t8M\t*\t0\t0\tNNNNNNNN\t!!!!!!!!\tRG:Z:rg1\tHP:i:1\tZZ:Z:keep\n'
+    printf 'qLong\t0\tchrV\t1\t40\t500M\t*\t0\t0\t%s\t%s\tRG:Z:rg1\tHP:i:1\tZZ:Z:keep\n' \
         "$long_view_seq" "$long_view_qual"
-    printf 'qOther\t0\tchrV\t800\t20\t8M\t*\t0\t0\tNNNNNNNN\t!!!!!!!!\n'
+    printf 'qOther\t0\tchrV\t800\t20\t8M\t*\t0\t0\tNNNNNNNN\t!!!!!!!!\tRG:Z:rg2\tHP:i:2\tZZ:Z:drop\n'
+    printf 'qPair\t99\tchrV\t300\t50\t8M\t=\t900\t608\tNNNNNNNN\t!!!!!!!!\tRG:Z:rg1\tHP:i:3\tZZ:Z:pair\n'
+    printf 'qPair\t147\tchrV\t900\t50\t8M\t=\t300\t-608\tNNNNNNNN\t!!!!!!!!\tRG:Z:rg1\tHP:i:3\tZZ:Z:pair\n'
 } > "$WORK/aln.sam"
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
@@ -69,17 +76,56 @@ printf 'qShort\nqLong\n' > "$WORK/subset.txt"
 "$TOOL" annotate "$WORK/view.isam" --subset keep --from "$WORK/subset.txt"
 
 [[ $("$TOOL" view -c "$WORK/view.isam" chrV:250-260) == 1 ]]
+"$TOOL" view -c -o "$WORK/count.txt" "$WORK/view.isam" chrV:250-260
+[[ $(cat "$WORK/count.txt") == 1 ]]
 
 printf 'chrV\t249\t260\nchrV\t799\t807\n' > "$WORK/targets.bed"
 [[ $("$TOOL" view -c -L "$WORK/targets.bed" "$WORK/view.isam") == 2 ]]
 [[ $("$TOOL" view -c -L "$WORK/targets.bed" "$WORK/view.isam" chrV:250-260) == 1 ]]
+[[ $("$TOOL" view -c "$WORK/view.isam" chrV:90-110 chrV:795-810) == 3 ]]
+[[ $("$TOOL" view -c -L "$WORK/targets.bed" "$WORK/view.isam" chrV:1-1000 chrV:2000-3000) == 2 ]]
+printf 'qShort\nqOther\nqMissing\n' > "$WORK/qnames.txt"
+[[ $("$TOOL" view -c -N "$WORK/qnames.txt" "$WORK/view.isam") == 2 ]]
+printf 'rg1\n' > "$WORK/rg.txt"
+[[ $("$TOOL" view -c -r rg1 "$WORK/view.isam") == 4 ]]
+[[ $("$TOOL" view -c -R "$WORK/rg.txt" "$WORK/view.isam") == 4 ]]
+[[ $("$TOOL" view -c -l libB "$WORK/view.isam") == 1 ]]
+[[ $("$TOOL" view -c -m 100 "$WORK/view.isam") == 1 ]]
+[[ $("$TOOL" view -c -d ZZ:keep "$WORK/view.isam") == 2 ]]
+printf 'pair\nkeep\n' > "$WORK/zz_values.txt"
+[[ $("$TOOL" view -c -D ZZ:"$WORK/zz_values.txt" "$WORK/view.isam") == 4 ]]
+[[ $("$TOOL" view -c -P "$WORK/view.isam" chrV:895-905) == 2 ]]
 "$TOOL" view -H "$WORK/view.isam" | grep -q '^@SQ[[:space:]]SN:chrV'
+if "$TOOL" view "$WORK/view.isam" | grep -q '^@'; then
+    echo "default SAM view emitted header records"
+    exit 1
+fi
 if "$TOOL" view --no-header "$WORK/view.isam" | grep -q '^@'; then
     echo "--no-header emitted header records"
     exit 1
 fi
+if ! "$TOOL" view -h "$WORK/view.isam" | grep -q '^@SQ[[:space:]]SN:chrV'; then
+    echo "-h did not emit SAM header records"
+    exit 1
+fi
 "$TOOL" view -O bam -o "$WORK/region.bam" "$WORK/view.isam" chrV:250-260
 [[ $(samtools view -c "$WORK/region.bam") == 1 ]]
+"$TOOL" view -b -o "$WORK/region-b.bam" "$WORK/view.isam" chrV:250-260
+[[ $(samtools view -c "$WORK/region-b.bam") == 1 ]]
+"$TOOL" view -1 -o "$WORK/region-fast.bam" "$WORK/view.isam" chrV:250-260
+[[ $(samtools view -c "$WORK/region-fast.bam") == 1 ]]
+"$TOOL" view -u -o "$WORK/region-uncompressed.bam" "$WORK/view.isam" chrV:250-260
+[[ $(samtools view -c "$WORK/region-uncompressed.bam") == 1 ]]
+"$TOOL" view -O bam,level=1 -o "$WORK/region-level.bam" "$WORK/view.isam" chrV:250-260
+[[ $(samtools view -c "$WORK/region-level.bam") == 1 ]]
+
+{
+    printf '>chrV\n'
+    printf '%*s\n' 10000 '' | tr ' ' A
+} > "$WORK/ref.fa"
+samtools faidx "$WORK/ref.fa"
+"$TOOL" view -C -T "$WORK/ref.fa" -o "$WORK/region.cram" "$WORK/view.isam" chrV:250-260
+[[ $(samtools view -T "$WORK/ref.fa" -c "$WORK/region.cram") == 1 ]]
 
 cat > "$WORK/c_api_lmdb.c" <<'C'
 #include <stdio.h>
@@ -120,7 +166,7 @@ int main(int argc, char **argv) {
     sam_hdr_destroy(hdr);
     isam_close(fp);
     if (rc != ISAM_EOF) return fail("isam_read1 returned an error");
-    if (seq_count != 3 || qlong_count != 1) return fail("unexpected sequential counts");
+    if (seq_count != 5 || qlong_count != 1) return fail("unexpected sequential counts");
 
     fp = isam_open(argv[1], "r");
     if (!fp) return fail("second isam_open failed");
