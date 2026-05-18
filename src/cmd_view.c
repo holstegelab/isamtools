@@ -63,6 +63,14 @@ static void usage(void) {
         "  -l STR           Require library (via RG:LB header metadata).\n"
         "  -d TAG[:VALUE]   Require aux tag, optionally with value.\n"
         "  -D TAG:P         Require aux tag whose value is listed in P.\n"
+        "      --subsample F  Keep fraction F of read names.\n"
+        "      --subsample-seed INT  Seed for --subsample.\n"
+        "  -s INT.FRAC      Same as --subsample 0.FRAC --subsample-seed INT.\n"
+        "\n"
+        "Processing options:\n"
+        "  -x TAGS          Comma-separated aux tags to strip; -x ^TAGS keeps only TAGS.\n"
+        "      --keep-tag TAGS  Preserve only comma-separated aux tags.\n"
+        "  -p, --unmap      Emit unselected records with UNMAP flag set.\n"
         "\n"
         "General options:\n"
         "  -?, --help       Show this help.\n"
@@ -102,6 +110,13 @@ typedef struct tag_filter {
     str_set_t values;
 } tag_filter_t;
 
+typedef struct view_output_policy {
+    int unmap_unselected;
+    isam_tag_set_t remove_tags;
+    isam_tag_set_t keep_tags;
+    int keep_tags_active;
+} view_output_policy_t;
+
 typedef struct view_filter {
     int require_all;
     int exclude_any;
@@ -109,6 +124,9 @@ typedef struct view_filter {
     int exclude_all;
     int min_mapq;
     int min_qlen;
+    int subsample_active;
+    double subsample_fraction;
+    uint64_t subsample_seed;
     str_set_t read_groups;
     str_set_t libraries;
     int qname_filter_active;
@@ -384,6 +402,44 @@ static void view_filter_destroy(view_filter_t *f) {
     memset(f, 0, sizeof *f);
 }
 
+static void parse_tag_list_into(isam_tag_set_t *tags, const char *arg) {
+    if (isam_tag_set_parse_csv(tags, arg) != 0)
+        die("invalid tag list '%s'", arg);
+}
+
+static void remove_tags_not_in(bam1_t *record, const isam_tag_set_t *keep_tags) {
+    int changed;
+    do {
+        changed = 0;
+        for (uint8_t *field = bam_aux_first(record); field;
+             field = bam_aux_next(record, field)) {
+            char tag[3] = { bam_aux_tag(field)[0], bam_aux_tag(field)[1], 0 };
+            if (isam_tag_set_contains(keep_tags, tag))
+                continue;
+            if (bam_aux_del(record, field) != 0)
+                die("failed to remove aux tag '%s'", tag);
+            changed = 1;
+            break;
+        }
+    } while (changed);
+}
+
+static void apply_output_policy(bam1_t *record,
+                                const view_output_policy_t *policy,
+                                int selected) {
+    if (!selected && policy->unmap_unselected)
+        record->core.flag |= BAM_FUNMAP;
+    if (policy->keep_tags_active)
+        remove_tags_not_in(record, &policy->keep_tags);
+    isam_aux_tags_remove(record, &policy->remove_tags);
+}
+
+static void view_output_policy_destroy(view_output_policy_t *policy) {
+    isam_tag_set_destroy(&policy->remove_tags);
+    isam_tag_set_destroy(&policy->keep_tags);
+    memset(policy, 0, sizeof *policy);
+}
+
 static void load_qname_file(view_t *v, i64_set_t *ids, const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) die("cannot open qname file '%s': %s", path, strerror(errno));
@@ -429,6 +485,58 @@ static int cigar_query_bases(int n_cigar, const uint32_t *cigar) {
     }
     if (q > INT_MAX) return INT_MAX;
     return (int)q;
+}
+
+static uint64_t mix_u64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static int subsample_keep(const view_filter_t *f, int64_t read_id) {
+    if (!f->subsample_active)
+        return 1;
+    if (f->subsample_fraction <= 0.0)
+        return 0;
+    if (f->subsample_fraction >= 1.0)
+        return 1;
+    uint64_t h = mix_u64((uint64_t)read_id ^ mix_u64(f->subsample_seed));
+    double unit = (double)(h >> 11) * (1.0 / 9007199254740992.0);
+    return unit < f->subsample_fraction;
+}
+
+static double parse_fraction(const char *s, const char *what) {
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (!s[0] || (end && *end) || v < 0.0 || v > 1.0)
+        die("invalid %s '%s' (expected 0..1)", what, s);
+    return v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *what);
+
+static void parse_subsample_s(view_filter_t *f, const char *arg) {
+    const char *dot = strchr(arg, '.');
+    if (!dot || dot == arg || !dot[1])
+        die("invalid -s argument '%s' (expected INT.FRAC)", arg);
+    char seed_buf[32];
+    size_t seed_len = (size_t)(dot - arg);
+    if (seed_len >= sizeof seed_buf)
+        die("invalid -s seed in '%s'", arg);
+    memcpy(seed_buf, arg, seed_len);
+    seed_buf[seed_len] = 0;
+    f->subsample_seed = (uint64_t)parse_nonnegative_int(seed_buf, "subsample seed");
+
+    char frac_buf[64];
+    size_t frac_len = strlen(dot + 1);
+    if (frac_len + 3 > sizeof frac_buf)
+        die("invalid -s fraction in '%s'", arg);
+    frac_buf[0] = '0';
+    frac_buf[1] = '.';
+    memcpy(frac_buf + 2, dot + 1, frac_len + 1);
+    f->subsample_fraction = parse_fraction(frac_buf, "subsample fraction");
+    f->subsample_active = 1;
 }
 
 static int parse_nonnegative_int(const char *s, const char *what) {
@@ -510,6 +618,7 @@ static int passes_record_filter(view_filter_t *f,
         cigar_query_bases(rec->n_cigar, rec->cigar) < f->min_qlen) return 0;
     if (f->qname_filter_active &&
         !i64_set_contains(&f->qname_ids, rec->store_read_id)) return 0;
+    if (!subsample_keep(f, rec->store_read_id)) return 0;
     return 1;
 }
 
@@ -617,16 +726,25 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                             bam1_t *canon_buf, bam1_t *out_buf,
                             view_filter_t *filter,
                             const bed_filter_t *bed_filter,
+                            const view_output_policy_t *output_policy,
                             const isam_tag_set_t *shared_tags,
                             const isam_tag_set_t *dropped_tags,
                             int count_only) {
-    if (!passes_record_filter(filter, rec)) return 0;
-    if (!overlaps_bed(bed_filter, rec->tid, rec->pos0, rec->end0)) return 0;
+    int selected = passes_record_filter(filter, rec) &&
+                   overlaps_bed(bed_filter, rec->tid, rec->pos0, rec->end0);
+    if (!selected && !output_policy->unmap_unselected)
+        return 0;
     int need_bam = !count_only || view_filter_needs_bam(filter);
+    if (!selected && output_policy->unmap_unselected)
+        need_bam = 1;
     if (need_bam) {
         rebuild_lmdb_record(v, rec, cache, canon_buf, out_buf,
                             shared_tags, dropped_tags);
-        if (!passes_bam_filter(filter, hdr, out_buf)) return 0;
+        if (selected && !passes_bam_filter(filter, hdr, out_buf))
+            selected = 0;
+        if (!selected && !output_policy->unmap_unselected)
+            return 0;
+        apply_output_policy(out_buf, output_policy, selected);
     }
     if (count_only) return 1;
 
@@ -652,6 +770,9 @@ int cmd_view(int argc, char **argv) {
     int n_threads = 0;
     const char *order = "coordinate";
     view_filter_t filter = { 0 };
+    view_output_policy_t output_policy = { 0 };
+    isam_tag_set_init(&output_policy.remove_tags);
+    isam_tag_set_init(&output_policy.keep_tags);
 
     static struct option longopts[] = {
         {"bam",         no_argument, 0, 'b'},
@@ -711,7 +832,7 @@ int cmd_view(int argc, char **argv) {
     int c;
     optind = 1;
     while ((c = getopt_long(argc, argv,
-                            "1bBCcd:D:e:f:F:G:hHL:l:Mm:N:O:o:PpR:r:Ss:t:T:uU:Xx:z:@:?",
+                            "1bBCcd:D:e:f:F:G:hHL:l:Mm:N:O:o:Ppq:R:r:Ss:t:T:uU:Xx:z:@:?",
                             longopts, NULL)) != -1) {
         switch (c) {
         case '1': out_fmt = VIEW_OUT_BAM; compression_level = 1; break;
@@ -736,18 +857,25 @@ int cmd_view(int argc, char **argv) {
             set_output_format(&out_fmt, optarg, &compression_level);
             break;
         case 'P': fetch_pairs = 1; break;
-        case 'p': unsupported_option("-p/--unmap"); break;
+        case 'p': output_policy.unmap_unselected = 1; break;
         case 'q': filter.min_mapq = atoi(optarg); break;
         case 'R': str_set_load_file(&filter.read_groups, optarg, "read-group"); break;
         case 'r': str_set_add(&filter.read_groups, optarg); break;
         case 'S': break;
-        case 's': unsupported_option("-s/--subsample"); break;
+        case 's': parse_subsample_s(&filter, optarg); break;
         case 't': break;
         case 'T': reference_path = optarg; break;
         case 'u': out_fmt = VIEW_OUT_BAM; compression_level = 0; break;
         case 'U': unsupported_option("-U/--output-unselected"); break;
         case 'X': unsupported_option("-X/--customized-index"); break;
-        case 'x': unsupported_option("-x/--remove-tag"); break;
+        case 'x':
+            if (optarg[0] == '^') {
+                parse_tag_list_into(&output_policy.keep_tags, optarg + 1);
+                output_policy.keep_tags_active = 1;
+            } else {
+                parse_tag_list_into(&output_policy.remove_tags, optarg);
+            }
+            break;
         case 'z': unsupported_option("-z/--sanitize"); break;
         case '@': n_threads = atoi(optarg); break;
         case '?':
@@ -767,11 +895,19 @@ int cmd_view(int argc, char **argv) {
         case 1006: subset = optarg; break;
         case 1007: set_output_format_option(optarg, &compression_level); break;
         case 1008: break;
-        case 1009: unsupported_option("--subsample"); break;
-        case 1010: unsupported_option("--subsample-seed"); break;
+        case 1009:
+            filter.subsample_fraction = parse_fraction(optarg, "subsample fraction");
+            filter.subsample_active = 1;
+            break;
+        case 1010:
+            filter.subsample_seed = (uint64_t)parse_nonnegative_int(optarg, "subsample seed");
+            break;
         case 1011: unsupported_option("--add-flags"); break;
         case 1012: unsupported_option("--remove-flags"); break;
-        case 1013: unsupported_option("--keep-tag"); break;
+        case 1013:
+            parse_tag_list_into(&output_policy.keep_tags, optarg);
+            output_policy.keep_tags_active = 1;
+            break;
         case 1014: unsupported_option("--write-index"); break;
         case 1015: break;
         case 1016: unsupported_option("--input-fmt-option"); break;
@@ -789,6 +925,8 @@ int cmd_view(int argc, char **argv) {
         die("compression options require BAM or CRAM output");
     if (fetch_pairs && n_regions == 0 && !bed_path)
         die("-P/--fetch-pairs requires a region or -L/--targets-file");
+    if (fetch_pairs && output_policy.unmap_unselected)
+        die("-P/--fetch-pairs cannot be combined with -p/--unmap");
 
     view_t *v = view_open_read(isam_path);
     view_link_store(v, store_override, store_idx_override);
@@ -882,6 +1020,7 @@ int cmd_view(int argc, char **argv) {
     if (header_only) {
         bed_filter_destroy(&bed_filter);
         view_filter_destroy(&filter);
+        view_output_policy_destroy(&output_policy);
         if (out) sam_close(out);
         view_close(v);
         return 0;
@@ -911,6 +1050,8 @@ int cmd_view(int argc, char **argv) {
     int unmapped_region = 0;
     if (region) {
         if (strcmp(region, "*") == 0) {
+            if (output_policy.unmap_unselected)
+                die("-p/--unmap cannot be combined with '*' unmapped region selection");
             int64_t has_coord = 0;
             view_meta_get_i64(v, "indexed_coord", &has_coord);
             if (!has_coord)
@@ -932,11 +1073,33 @@ int cmd_view(int argc, char **argv) {
                     "run `isamtools sort --interval %s`", isam_path);
             beg = (int64_t)hbeg;
             end = (int64_t)hend;
-            iter_kind = LMDB_VIEW_ITER_REGION;
+            if (output_policy.unmap_unselected) {
+                if (use_bed_filter) {
+                    bed_filter_t intersected = { 0 };
+                    for (size_t i = 0; i < bed_filter.n; ++i) {
+                        if (bed_filter.items[i].tid != tid)
+                            continue;
+                        int64_t ibeg = bed_filter.items[i].beg > beg
+                            ? bed_filter.items[i].beg : beg;
+                        int64_t iend = bed_filter.items[i].end < end
+                            ? bed_filter.items[i].end : end;
+                        bed_filter_add(&intersected, tid, ibeg, iend);
+                    }
+                    bed_filter_destroy(&bed_filter);
+                    bed_filter = intersected;
+                } else {
+                    bed_filter_add(&bed_filter, tid, beg, end);
+                    use_bed_filter = 1;
+                }
+                region = NULL;
+            } else {
+                iter_kind = LMDB_VIEW_ITER_REGION;
+            }
         }
     }
 
-    if (have_subset && !subset_from_store && (use_bed_filter || region)) {
+    if (!output_policy.unmap_unselected &&
+        have_subset && !subset_from_store && (use_bed_filter || region)) {
         lmdb_view_iter_t *it = lmdb_view_iter_open_subset(v->lmdb, subset_id);
         lmdb_view_record_t rec;
         while (lmdb_view_iter_next(it, &rec)) {
@@ -952,6 +1115,7 @@ int cmd_view(int argc, char **argv) {
             int selected = emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                             canon, outb, &filter,
                                             use_bed_filter ? &bed_filter : NULL,
+                                            &output_policy,
                                             &shared_tags, &dropped_tags,
                                             fetch_pairs ? 1 : count_only);
             if (fetch_pairs) {
@@ -962,7 +1126,7 @@ int cmd_view(int argc, char **argv) {
             lmdb_view_record_clear(&rec);
         }
         lmdb_view_iter_close(it);
-    } else if (use_bed_filter) {
+    } else if (use_bed_filter && !output_policy.unmap_unselected) {
         int64_t has_iv = 0;
         view_meta_get_i64(v, "indexed_interval", &has_iv);
         if (!has_iv)
@@ -994,6 +1158,7 @@ int cmd_view(int argc, char **argv) {
                     int selected = emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                                     canon, outb, &filter,
                                                     &bed_filter,
+                                                    &output_policy,
                                                     &shared_tags, &dropped_tags,
                                                     fetch_pairs ? 1 : count_only);
                     if (fetch_pairs) {
@@ -1034,6 +1199,7 @@ int cmd_view(int argc, char **argv) {
             int selected = emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                             canon, outb, &filter,
                                             use_bed_filter ? &bed_filter : NULL,
+                                            &output_policy,
                                             &shared_tags, &dropped_tags,
                                             fetch_pairs ? 1 : count_only);
             if (fetch_pairs) {
@@ -1057,6 +1223,7 @@ int cmd_view(int argc, char **argv) {
                 if (!seen_aln_id(&emitted, rec.aln_id))
                     n_emit += emit_lmdb_record(out, v->hdr, v, &rec, cache,
                                                canon, outb, &filter, NULL,
+                                               &output_policy,
                                                &shared_tags, &dropped_tags,
                                                count_only);
                 lmdb_view_record_clear(&rec);
@@ -1080,6 +1247,7 @@ int cmd_view(int argc, char **argv) {
     i64_set_destroy(&pair_reads);
     bed_filter_destroy(&bed_filter);
     view_filter_destroy(&filter);
+    view_output_policy_destroy(&output_policy);
     payload_cache_destroy(cache);
     isam_tag_set_destroy(&shared_tags);
     isam_tag_set_destroy(&dropped_tags);

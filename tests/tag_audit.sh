@@ -28,12 +28,12 @@ SAM
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
-"$TOOL" index --share-tags rt -o "$WORK/store.isam" "$WORK/store.bam" 2>"$WORK/index.err"
+"$TOOL" index --share-tags rt -o "$WORK/store.ssam" "$WORK/store.bam" 2>"$WORK/index.err"
 grep -q 'unknown canonical aux tags are not shared: zz' "$WORK/index.err"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.isam" \
+    --store-index "$WORK/store.ssam" \
     --aln "$WORK/view.isam" 2>"$WORK/import.err"
 grep -q 'unknown aux tags default to alignment retention: zz' "$WORK/import.err"
 

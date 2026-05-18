@@ -58,14 +58,15 @@ long_view_qual=$(printf '%*s' 500 '' | tr ' ' '!')
 } > "$WORK/aln.sam"
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
+samtools index "$WORK/store.bam"
 
-"$TOOL" index -o "$WORK/store.isam" "$WORK/store.bam"
-test -f "$WORK/store.isam"
-test -f "$WORK/store.isam-lock"
+"$TOOL" index -o "$WORK/store.ssam" "$WORK/store.bam"
+test -f "$WORK/store.ssam"
+test -f "$WORK/store.ssam-lock"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.isam" \
+    --store-index "$WORK/store.ssam" \
     --aln "$WORK/view.isam"
 test -f "$WORK/view.isam"
 test -f "$WORK/view.isam-lock"
@@ -74,6 +75,51 @@ test -f "$WORK/view.isam-lock"
 
 printf 'qShort\nqLong\n' > "$WORK/subset.txt"
 "$TOOL" annotate "$WORK/view.isam" --subset keep --from "$WORK/subset.txt"
+
+"$TOOL" query \
+    --source hg38:"$WORK/store.ssam" \
+    --source chm13:"$WORK/view.isam" \
+    --select chm13:chrV:895-905 \
+    --columns qname,hg38.region,chm13.region,chm13.n,chm13.in_subset:keep \
+    > "$WORK/query.tsv"
+grep -q $'^qname\thg38.region\tchm13.region\tchm13.n\tchm13.in_subset:keep$' "$WORK/query.tsv"
+grep -q $'^qPair\tchrS:900-907\tchrV:300-307;chrV:900-907\t2\t0$' "$WORK/query.tsv"
+
+"$TOOL" query \
+    --source hg38:"$WORK/store.ssam" \
+    --source chm13:"$WORK/view.isam" \
+    --subset chm13:keep \
+    --columns qname,hg38.region,chm13.region \
+    > "$WORK/query_subset.tsv"
+[[ $(awk 'NR > 1 { ++n } END { print n + 0 }' "$WORK/query_subset.tsv") == 2 ]]
+grep -q $'^qLong\tchrS:10-509\tchrV:1-500$' "$WORK/query_subset.tsv"
+grep -q $'^qShort\tchrS:1-8\tchrV:100-107$' "$WORK/query_subset.tsv"
+
+"$TOOL" query \
+    --source hg38:"$WORK/store.ssam" \
+    --source chm13:"$WORK/view.isam" \
+    --select hg38:chrS:895-905 \
+    --columns qname,hg38.region,chm13.region \
+    --no-header \
+    > "$WORK/query_store_region.tsv"
+grep -q $'^qPair\tchrS:900-907\tchrV:300-307;chrV:900-907$' "$WORK/query_store_region.tsv"
+
+"$TOOL" query \
+    --source "$WORK/view.isam" \
+    --select isam:chrV:895-905 \
+    --columns qname,isam.region \
+    --no-header \
+    > "$WORK/query_implicit_isam.tsv"
+grep -q $'^qPair\tchrV:300-307;chrV:900-907$' "$WORK/query_implicit_isam.tsv"
+
+"$TOOL" query \
+    --source chm13:"$WORK/view.isam" \
+    --select chm13:chrV:895-905 \
+    --subset chm13:keep \
+    --join inner \
+    --columns qname,chm13.region \
+    > "$WORK/query_inner.tsv"
+[[ $(awk 'NR > 1 { ++n } END { print n + 0 }' "$WORK/query_inner.tsv") == 0 ]]
 
 [[ $("$TOOL" view -c "$WORK/view.isam" chrV:250-260) == 1 ]]
 "$TOOL" view -c -o "$WORK/count.txt" "$WORK/view.isam" chrV:250-260
@@ -95,6 +141,28 @@ printf 'rg1\n' > "$WORK/rg.txt"
 printf 'pair\nkeep\n' > "$WORK/zz_values.txt"
 [[ $("$TOOL" view -c -D ZZ:"$WORK/zz_values.txt" "$WORK/view.isam") == 4 ]]
 [[ $("$TOOL" view -c -P "$WORK/view.isam" chrV:895-905) == 2 ]]
+[[ $("$TOOL" view -c --subsample 1 "$WORK/view.isam") == 5 ]]
+[[ $("$TOOL" view -c --subsample 0 "$WORK/view.isam") == 0 ]]
+[[ $("$TOOL" view -c -s 7.0 "$WORK/view.isam") == 0 ]]
+"$TOOL" view --subsample 0.5 --subsample-seed 17 --no-header "$WORK/view.isam" > "$WORK/subsample_a.sam"
+"$TOOL" view --subsample 0.5 --subsample-seed 17 --no-header "$WORK/view.isam" > "$WORK/subsample_b.sam"
+cmp "$WORK/subsample_a.sam" "$WORK/subsample_b.sam"
+if "$TOOL" view --no-header -x ZZ "$WORK/view.isam" | awk '{ for (i = 12; i <= NF; ++i) if ($i ~ /^ZZ:/) found = 1 } END { exit found ? 0 : 1 }'; then
+    echo "-x ZZ did not remove ZZ tags"
+    exit 1
+fi
+if "$TOOL" view --no-header --keep-tag RG "$WORK/view.isam" | awk '{ for (i = 12; i <= NF; ++i) if ($i !~ /^RG:/) bad = 1 } END { exit bad ? 0 : 1 }'; then
+    echo "--keep-tag RG left non-RG aux tags"
+    exit 1
+fi
+if "$TOOL" view --no-header -x ^RG "$WORK/view.isam" | awk '{ for (i = 12; i <= NF; ++i) if ($i !~ /^RG:/) bad = 1 } END { exit bad ? 0 : 1 }'; then
+    echo "-x ^RG left non-RG aux tags"
+    exit 1
+fi
+"$TOOL" view --no-header -p "$WORK/view.isam" chrV:895-905 > "$WORK/unmap.sam"
+[[ $(awk 'END { print NR }' "$WORK/unmap.sam") == 5 ]]
+awk '$1=="qShort" { if (int($2 / 4) % 2 == 0) exit 1; found = 1 } END { exit found ? 0 : 1 }' "$WORK/unmap.sam"
+awk '$1=="qPair" && $4==900 { if (int($2 / 4) % 2 != 0) exit 1; found = 1 } END { exit found ? 0 : 1 }' "$WORK/unmap.sam"
 "$TOOL" view -H "$WORK/view.isam" | grep -q '^@SQ[[:space:]]SN:chrV'
 if "$TOOL" view "$WORK/view.isam" | grep -q '^@'; then
     echo "default SAM view emitted header records"

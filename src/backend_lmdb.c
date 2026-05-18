@@ -1212,6 +1212,45 @@ int lmdb_store_lookup_qname(lmdb_backend_t *b,
     return lmdb_store_lookup_read_id(b, read_id, out);
 }
 
+struct lmdb_store_iter {
+    lmdb_backend_t *b;
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    int started;
+};
+
+lmdb_store_iter_t *lmdb_store_iter_open(lmdb_backend_t *b) {
+    lmdb_store_iter_t *it = xcalloc(1, sizeof *it);
+    it->b = b;
+    int rc = mdb_txn_begin(b->env, NULL, MDB_RDONLY, &it->txn);
+    if (rc) lmdb_die(rc, "txn_begin", b->path);
+    rc = mdb_cursor_open(it->txn, b->canonical_by_id, &it->cursor);
+    if (rc) lmdb_die(rc, "cursor(canonical_by_id)", b->path);
+    return it;
+}
+
+int lmdb_store_iter_next(lmdb_store_iter_t *it,
+                         lmdb_store_record_t *out) {
+    memset(out, 0, sizeof *out);
+    MDB_val key = { 0, NULL }, val = { 0, NULL };
+    int rc = mdb_cursor_get(it->cursor, &key, &val,
+                            it->started ? MDB_NEXT : MDB_FIRST);
+    it->started = 1;
+    if (rc == MDB_NOTFOUND)
+        return 0;
+    if (rc)
+        lmdb_die(rc, "cursor(canonical_by_id)", it->b->path);
+    decode_record(&val, out);
+    return 1;
+}
+
+void lmdb_store_iter_close(lmdb_store_iter_t *it) {
+    if (!it) return;
+    if (it->cursor) mdb_cursor_close(it->cursor);
+    if (it->txn) mdb_txn_abort(it->txn);
+    free(it);
+}
+
 void lmdb_store_record_clear(lmdb_store_record_t *rec) {
     if (!rec) return;
     free(rec->qname);

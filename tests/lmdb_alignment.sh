@@ -38,10 +38,10 @@ SAM
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
-"$TOOL" index -o "$WORK/store.lmdb.isam" "$WORK/store.bam"
+"$TOOL" index -o "$WORK/store.lmdb.ssam" "$WORK/store.bam"
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.lmdb.isam" \
+    --store-index "$WORK/store.lmdb.ssam" \
     --aln "$WORK/view.lmdb.isam"
 test -f "$WORK/view.lmdb.isam"
 test -s "$WORK/view.lmdb.isam"

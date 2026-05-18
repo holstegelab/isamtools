@@ -43,8 +43,8 @@ samtools index "$WORK/canonical.sub.bam"
 samtools index "$WORK/alignment.sub.bam"
 
 "$TOOL" index "$WORK/canonical.sub.bam"
-[[ -f "$WORK/canonical.sub.isam" ]]
-[[ ! -f "$WORK/canonical.sub.bam.isam" ]]
+[[ -f "$WORK/canonical.sub.ssam" ]]
+[[ ! -f "$WORK/canonical.sub.bam.ssam" ]]
 
 "$TOOL" import "$WORK/alignment.sub.bam" \
     --store "$WORK/canonical.sub.bam" \
@@ -87,7 +87,7 @@ grep -q "canonical store reads must keep full SEQ/QUAL" "$WORK/bad_store.err"
 
 echo "private data validation OK"
 echo "  workdir: $WORK"
-echo "  canonical index: $WORK/canonical.sub.isam"
+echo "  canonical index: $WORK/canonical.sub.ssam"
 echo "  alignment view:  $WORK/alignment.sub.isam"
 echo "  subset count:    $subset_count"
 echo "  subset region:   $subset_region ($subset_region_count records)"

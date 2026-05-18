@@ -1,6 +1,6 @@
 # isamtools update
 
-Mutate metadata in a store index or alignment-view `.isam`.
+Mutate metadata in a store `.ssam` or alignment-view `.isam`.
 
 ```bash
 isamtools update [options] <isam-or-store>

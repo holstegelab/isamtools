@@ -11,7 +11,7 @@ isamtools check [options] <input.sam|bam|cram>
 
 - `--view PATH`: alignment-view `.isam` to compare against.
 - `--store PATH`: canonical store BAM/CRAM for store-only checks, or store override for view checks.
-- `--store-index PATH`: store `.isam` path.
+- `--store-index PATH`: store `.ssam` path.
 - `--allow-missing`: in store-only mode, skip primary records absent from the store.
 - `-h, --help`: show command help.
 

@@ -29,14 +29,14 @@ SAM
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
-"$TOOL" index -o "$WORK/store.lmdb.isam" "$WORK/store.bam"
-test -f "$WORK/store.lmdb.isam"
-test -s "$WORK/store.lmdb.isam"
-test -f "$WORK/store.lmdb.isam-lock"
+"$TOOL" index -o "$WORK/store.lmdb.ssam" "$WORK/store.bam"
+test -f "$WORK/store.lmdb.ssam"
+test -s "$WORK/store.lmdb.ssam"
+test -f "$WORK/store.lmdb.ssam-lock"
 
 "$TOOL" import "$WORK/view.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.lmdb.isam" \
+    --store-index "$WORK/store.lmdb.ssam" \
     --aln "$WORK/view.isam"
 "$TOOL" sort --all "$WORK/view.isam"
 

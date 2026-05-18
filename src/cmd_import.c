@@ -25,7 +25,7 @@ static void usage(void) {
         "\n"
         "Options:\n"
         "  --store PATH         Canonical store (BAM/CRAM).\n"
-        "  --store-index PATH   Store .isam (default <store-root>.isam).\n"
+        "  --store-index PATH   Store .ssam (default <store-root>.ssam).\n"
         "  --aln PATH           Output alignment-view .isam (default <input-root>.isam).\n"
         "  --name NAME          Logical alias for the alignment view.\n"
         "  --carry-tags TAGS    Comma-separated source tags stored once per read.\n"
@@ -341,7 +341,7 @@ int cmd_import(int argc, char **argv) {
     char *final_aln_path = xstrdup(aln_path);
 
     char *store_idx_alloc = NULL;
-    if (!store_idx) { store_idx_alloc = isam_index_path_for(store_path);
+    if (!store_idx) { store_idx_alloc = isam_store_index_path_for(store_path);
                       store_idx = store_idx_alloc; }
 
     /* Open store + verify QNAME index. */

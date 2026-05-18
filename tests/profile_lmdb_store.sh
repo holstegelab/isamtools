@@ -46,11 +46,11 @@ awk -v n="$N" 'BEGIN {
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
 run_timed index_lmdb \
-    "$TOOL" index -o "$WORK/store.lmdb.isam" "$WORK/store.bam"
+    "$TOOL" index -o "$WORK/store.lmdb.ssam" "$WORK/store.bam"
 run_timed import_lmdb_store \
     "$TOOL" import "$WORK/aln.sam" \
         --store "$WORK/store.bam" \
-        --store-index "$WORK/store.lmdb.isam" \
+        --store-index "$WORK/store.lmdb.ssam" \
         --aln "$WORK/view.isam"
 run_timed sort_all \
     "$TOOL" sort --all "$WORK/view.isam"

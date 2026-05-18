@@ -1,9 +1,9 @@
 # isamtools sort
 
-Build logical indexes for a store index or alignment-view `.isam`.
+Build logical indexes for a store `.ssam` or alignment-view `.isam`.
 
 ```bash
-isamtools sort [options] <file.isam|store.bam|store.cram>
+isamtools sort [options] <file.isam|store.ssam|store.bam|store.cram>
 ```
 
 ## Options

@@ -16,7 +16,7 @@ typedef struct tag_stat {
 
 static void usage(void) {
     fputs(
-        "Usage: isamtools store_stats [options] <file.isam|store.bam|view.bam>\n"
+        "Usage: isamtools store_stats [options] <file.isam|file.ssam|store.bam|store.cram>\n"
         "\n"
         "Report LMDB table storage and logical record contents.\n"
         "\n"
@@ -28,10 +28,9 @@ static void usage(void) {
 }
 
 static char *resolve_isam_path(const char *p) {
-    size_t n = strlen(p);
-    if (n >= 5 && strcmp(p + n - 5, ".isam") == 0)
+    if (isam_is_view_index_path(p) || isam_is_store_index_path(p))
         return xstrdup(p);
-    return isam_index_path_for(p);
+    return isam_store_index_path_for(p);
 }
 
 static uint32_t get_be32(const unsigned char **p) {
@@ -252,6 +251,33 @@ static void print_dbi_stat(MDB_txn *txn,
            (uint64_t)st.ms_branch_pages,
            (uint64_t)st.ms_leaf_pages,
            (uint64_t)st.ms_overflow_pages);
+}
+
+static void print_storage_explanation(const char *type) {
+    printf("file_layout\n");
+    if (strcmp(type, "alignment") == 0) {
+        printf("role\talignment_view\n");
+        printf("stored_here\tread dictionary, imported alignment records, alignment indexes, view-local annotations/subsets, and import-carried read aux in read_aux_by_id\n");
+        printf("stored_elsewhere\tcanonical SEQ/QUAL/header payloads stay in the original store BAM/CRAM; canonical read identity and store-side annotations live in the linked .ssam\n");
+        printf("reconstruction\taln_by_id provides flags/position/CIGAR/mate/inline aux; read_aux_by_id adds per-read import aux; the linked store supplies canonical SEQ/QUAL and store annotations when viewing\n");
+    } else if (strcmp(type, "store") == 0) {
+        printf("role\tcanonical_store_index\n");
+        printf("stored_here\tcanonical read identity, qname lookup, placement hints, store-side annotations/subsets\n");
+        printf("stored_elsewhere\tfull primary BAM/CRAM records, including SEQ/QUAL and canonical aux, stay in the original store file\n");
+        printf("reconstruction\tthis .ssam resolves read_id and payload offsets; canonical SEQ/QUAL and canonical aux are then read from the original BAM/CRAM\n");
+    } else {
+        printf("role\tunknown\n");
+    }
+    printf("\nmetric_notes\n");
+    printf("lmdb_tables.entries\tnumber of records in that LMDB table\n");
+    printf("lmdb_tables.page_bytes\tphysical LMDB pages used by each table, including B-tree overhead and free space inside pages\n");
+    printf("key_value_bytes\tlogical bytes of LMDB keys plus stored values; excludes LMDB page overhead\n");
+    printf("raw_record_bytes\tuncompressed logical alignment-record value bytes before zstd\n");
+    printf("zstd_value_bytes\tcompressed value bytes currently stored for zstd-encoded records\n");
+    printf("cigar_bytes_in_aln_by_id\tCIGAR bytes embedded in alignment-view records; each CIGAR op is 4 bytes before record compression\n");
+    printf("inline_aux_bytes_in_aln_by_id\talignment-local aux fields embedded directly in alignment records, usually tags such as SA/mc/rm\n");
+    printf("read_aux_by_id\tbundled per-read aux overrides/import-carried tags stored once per read, not once per alignment\n");
+    printf("read_tag\tper-read typed annotation table used by annotate; not a duplicate of canonical BAM/CRAM aux\n\n");
 }
 
 static void print_lmdb_storage(lmdb_backend_t *b) {
@@ -564,6 +590,7 @@ int cmd_store_stats(int argc, char **argv) {
 
     printf("isam_path\t%s\n", isam_path);
     printf("isam_type\t%s\n\n", type);
+    print_storage_explanation(type);
     print_lmdb_storage(lmdb);
 
     if (storage_only) {

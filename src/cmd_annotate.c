@@ -8,7 +8,7 @@ static void usage(void) {
     fputs(
         "Usage: isamtools annotate [options] <isam-or-store>\n"
         "\n"
-        "Annotate a store .isam or alignment-view .isam.\n"
+        "Annotate a store .ssam or alignment-view .isam.\n"
         "\n"
         "Tag mode (default):\n"
         "  --from FILE     SAM-tag-like TSV: qname<TAB>TAG:TYPE:VALUE...\n"
@@ -20,16 +20,15 @@ static void usage(void) {
         "  --description S Optional subset description.\n"
         "\n"
         "Options:\n"
-        "  --allow-missing Skip qnames not present in the target .isam.\n"
+        "  --allow-missing Skip qnames not present in the target index.\n"
         "  -h, --help      Show this help.\n",
         stderr);
 }
 
 static char *resolve_isam_path(const char *p) {
-    size_t n = strlen(p);
-    if (n >= 5 && strcmp(p + n - 5, ".isam") == 0)
+    if (isam_is_view_index_path(p) || isam_is_store_index_path(p))
         return xstrdup(p);
-    return isam_index_path_for(p);
+    return isam_store_index_path_for(p);
 }
 
 static void rstrip(char *s) {
@@ -240,7 +239,7 @@ int cmd_annotate(int argc, char **argv) {
     if (!type) die("'%s' has no isam_type meta", isam_path);
     int is_store = (strcmp(type, "store") == 0);
     if (!is_store && strcmp(type, "alignment") != 0)
-        die("'%s' is not a recognized .isam (type=%s)", isam_path, type);
+        die("'%s' is not a recognized LMDB index (type=%s)", isam_path, type);
     free(type);
 
     char cmdbuf[1024]; cmdbuf[0] = 0;

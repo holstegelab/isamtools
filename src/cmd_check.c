@@ -19,7 +19,7 @@ static void usage(void) {
         "Options:\n"
         "  --view PATH         Alignment-view .isam to compare against.\n"
         "  --store PATH        Canonical store BAM/CRAM for store-only checks.\n"
-        "  --store-index PATH  Store .isam path.\n"
+        "  --store-index PATH  Store .ssam path.\n"
         "  --allow-missing     Skip primary records absent from the store.\n"
         "  -h, --help          Show this help.\n",
         stderr);
@@ -220,7 +220,7 @@ int isam_check_store_against_bam(const char *input_path,
                                  int allow_missing) {
     char *store_idx_alloc = NULL;
     if (!store_index_path) {
-        store_idx_alloc = isam_index_path_for(store_path);
+        store_idx_alloc = isam_store_index_path_for(store_path);
         store_index_path = store_idx_alloc;
     }
     store_t *store = store_open(store_path, store_index_path);

@@ -59,6 +59,7 @@ ISAM_SOURCES := \
 	src/cmd_check.c \
 	src/cmd_sort.c \
 	src/cmd_view.c \
+	src/cmd_query.c \
 	src/cmd_annotate.c \
 	src/cmd_store_stats.c \
 	src/cmd_audit_tags.c \

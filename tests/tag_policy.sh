@@ -30,12 +30,12 @@ SAM
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
-"$TOOL" index -o "$WORK/store.isam" "$WORK/store.bam" >/dev/null 2>"$WORK/index.err"
+"$TOOL" index -o "$WORK/store.ssam" "$WORK/store.bam" >/dev/null 2>"$WORK/index.err"
 grep -q 'read-level tags observed and reconstructible from canonical BAM/CRAM: .*RX' "$WORK/index.err"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.isam" \
+    --store-index "$WORK/store.ssam" \
     --aln "$WORK/view.isam" 2>"$WORK/import.err"
 grep -q 'stored-once tag conflicts found' "$WORK/import.err"
 grep -q 'HP: 1 reads with conflicts' "$WORK/import.err"
@@ -56,7 +56,7 @@ grep -q $'^xx\t1\t' <<<"$stats"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.isam" \
+    --store-index "$WORK/store.ssam" \
     --drop-source-tags RX \
     --aln "$WORK/source_drop.isam" >/dev/null 2>"$WORK/source_drop.err"
 qa_source_drop=$("$TOOL" view --no-header "$WORK/source_drop.isam" | awk '$1=="qA" && $2==0 { print; exit }')
@@ -65,7 +65,7 @@ grep -q $'RX:Z:canonA' <<<"$qa_source_drop"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
-    --store-index "$WORK/store.isam" \
+    --store-index "$WORK/store.ssam" \
     --drop-tags RX \
     --aln "$WORK/drop.isam" >/dev/null 2>"$WORK/drop.err"
 qa_drop=$("$TOOL" view --no-header "$WORK/drop.isam" | awk '$1=="qA" && $2==0 { print; exit }')

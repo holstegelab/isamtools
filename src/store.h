@@ -27,7 +27,7 @@ typedef struct store_record {
 
 typedef struct payload_cache payload_cache_t;
 
-/* Open a store + its .isam index (read-only). */
+/* Open a canonical store + its .ssam index (read-only). */
 store_t *store_open(const char *store_path, const char *index_path);
 void     store_close(store_t *st);
 

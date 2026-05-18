@@ -16,7 +16,7 @@ static void usage(void) {
     fputs(
         "Usage: isamtools index [options] <store.bam|store.cram>\n"
         "\n"
-    "Build the canonical store index <store-root>.isam.\n"
+    "Build the canonical store index <store-root>.ssam.\n"
         "By default builds the QNAME index (required for `import`).\n"
         "\n"
         "Options:\n"
@@ -26,7 +26,7 @@ static void usage(void) {
         "  --strict-tag-policy   Fail when unknown canonical tags are unresolved.\n"
         "  --verbose-tag-policy  Print a detailed tag policy summary.\n"
         "  --yes                 Accept tag policy warnings.\n"
-    "  -o, --output P   Override default output path (<store-root>.isam).\n"
+    "  -o, --output P   Override default output path (<store-root>.ssam).\n"
         "  -h, --help       Show this help.\n",
         stderr);
 }
@@ -319,7 +319,7 @@ static int index_lmdb(const char *store_path, const char *out_path,
     lmdb_store_put_meta(lmdb, "tag_policy_version", "1");
     fprintf(stderr, "isamtools index: tag policy before scanning\n");
     fprintf(stderr, "  store file: %s\n", store_path);
-    fprintf(stderr, "  canonical aux storage: not copied into the .isam; reconstructed from the canonical BAM/CRAM payload when needed\n");
+    fprintf(stderr, "  canonical aux storage: not copied into the .ssam; reconstructed from the canonical BAM/CRAM payload when needed\n");
     fprintf(stderr, "  read-level reconstruction candidates from policy/header: %s\n",
             effective_shared_tags[0] ? effective_shared_tags : "none");
     fprintf(stderr, "  header-declared read-level candidates: %s\n",
@@ -617,7 +617,7 @@ int cmd_index(int argc, char **argv) {
 
     char *out_alloc = NULL;
     if (!out_path) {
-        out_alloc = isam_index_path_for(store_path);
+        out_alloc = isam_store_index_path_for(store_path);
         out_path = out_alloc;
     }
 

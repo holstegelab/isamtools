@@ -26,7 +26,7 @@ if [[ ! -s $TD/hg38.sub.bam ]]; then
 fi
 
 # 2. Pipeline.
-rm -f "$TD"/*.isam
+rm -f "$TD"/*.isam "$TD"/*.ssam
 "$TOOL" index  "$TD/chm13.sub.bam"
 "$TOOL" import "$TD/hg38.sub.bam" \
     --store "$TD/chm13.sub.bam" \

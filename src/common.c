@@ -43,27 +43,44 @@ char *xstrdup(const char *s) {
     return r;
 }
 
-static int has_path_suffix(const char *path, const char *suffix) {
+int isam_has_path_suffix(const char *path, const char *suffix) {
     size_t path_len = strlen(path);
     size_t suffix_len = strlen(suffix);
     return path_len >= suffix_len &&
            strcmp(path + path_len - suffix_len, suffix) == 0;
 }
 
-char *isam_index_path_for(const char *store_path) {
-    size_t stem_len = strlen(store_path);
-    if (has_path_suffix(store_path, ".bam")) {
+int isam_is_view_index_path(const char *path) {
+    return isam_has_path_suffix(path, ".isam");
+}
+
+int isam_is_store_index_path(const char *path) {
+    return isam_has_path_suffix(path, ".ssam");
+}
+
+static char *index_path_for(const char *input_path, const char *extension) {
+    size_t stem_len = strlen(input_path);
+    if (isam_has_path_suffix(input_path, ".bam")) {
         stem_len -= 4;
-    } else if (has_path_suffix(store_path, ".cram")) {
+    } else if (isam_has_path_suffix(input_path, ".cram")) {
         stem_len -= 5;
-    } else if (has_path_suffix(store_path, ".sam")) {
+    } else if (isam_has_path_suffix(input_path, ".sam")) {
         stem_len -= 4;
     }
 
-    char *r = xmalloc(stem_len + 6);
-    memcpy(r, store_path, stem_len);
-    memcpy(r + stem_len, ".isam", 6);
+    size_t ext_len = strlen(extension);
+    char *r = xmalloc(stem_len + ext_len + 1);
+    memcpy(r, input_path, stem_len);
+    memcpy(r + stem_len, extension, ext_len + 1);
     return r;
+}
+
+char *isam_index_path_for(const char *input_path) {
+    return index_path_for(input_path, ".isam");
+}
+
+char *isam_store_index_path_for(const char *store_path) {
+    return index_path_for(store_path, ".ssam");
 }
 
 char *now_iso8601(void) {

@@ -36,7 +36,7 @@ store_t *store_open(const char *store_path, const char *index_path) {
     if (stat(index_path, &idx_st) != 0)
         die("stat store index '%s' failed: %s", index_path, strerror(errno));
     if (S_ISDIR(idx_st.st_mode))
-        die("store index '%s' is a directory; LMDB indexes are file-backed .isam files",
+        die("store index '%s' is a directory; LMDB store indexes are file-backed .ssam files",
             index_path);
     st->lmdb = lmdb_backend_open(index_path, /*readonly*/1, 0);
     char *type = lmdb_backend_meta_get(st->lmdb, "isam_type");

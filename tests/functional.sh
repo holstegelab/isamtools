@@ -70,8 +70,8 @@ samtools view -bS "$WORK/store_b.sam" -o "$WORK/store_b.bam"
 samtools view -bS "$WORK/fallback_store.sam" -o "$WORK/fallback_store.bam"
 
 "$TOOL" index "$WORK/store_a.bam"
-[[ -f "$WORK/store_a.isam" ]]
-[[ ! -f "$WORK/store_a.bam.isam" ]]
+[[ -f "$WORK/store_a.ssam" ]]
+[[ ! -f "$WORK/store_a.bam.ssam" ]]
 
 "$TOOL" check "$WORK/store_a.bam" --store "$WORK/store_a.bam" 2>"$WORK/check_store.err"
 grep -q "4 primary records match store" "$WORK/check_store.err"
@@ -193,11 +193,11 @@ printf 'qA\tST:Z:store-a\n' > "$WORK/store_tags.tsv"
 line_with_store_tag=$($TOOL view --no-header "$WORK/view.isam" | awk '$1=="qA" && $2==0 { print; exit }')
 grep -q $'ST:Z:store-a' <<<"$line_with_store_tag"
 
-"$TOOL" index -o "$WORK/store_b.isam" "$WORK/store_b.bam"
+"$TOOL" index -o "$WORK/store_b.ssam" "$WORK/store_b.bam"
 
 "$TOOL" rehint "$WORK/view.isam" \
     --store "$WORK/store_b.bam" \
-    --store-index "$WORK/store_b.isam"
+    --store-index "$WORK/store_b.ssam"
 
 [[ $("$TOOL" view -c --subset keep "$WORK/view.isam") == 2 ]]
 [[ $("$TOOL" view -c --subset keep "$WORK/view.isam" chrV:145-155) == 1 ]]

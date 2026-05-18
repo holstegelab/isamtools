@@ -82,6 +82,7 @@ typedef enum lmdb_view_iter_kind {
 } lmdb_view_iter_kind_t;
 
 typedef struct lmdb_view_iter lmdb_view_iter_t;
+typedef struct lmdb_store_iter lmdb_store_iter_t;
 
 lmdb_backend_t *lmdb_backend_open(const char *path, int readonly,
                                   size_t map_size_bytes);
@@ -115,6 +116,10 @@ int             lmdb_store_lookup_read_id(lmdb_backend_t *b,
                                           int64_t read_id,
                                           lmdb_store_record_t *out);
 void            lmdb_store_record_clear(lmdb_store_record_t *rec);
+lmdb_store_iter_t *lmdb_store_iter_open(lmdb_backend_t *b);
+int             lmdb_store_iter_next(lmdb_store_iter_t *it,
+                                     lmdb_store_record_t *out);
+void            lmdb_store_iter_close(lmdb_store_iter_t *it);
 
 void            lmdb_view_put_meta(lmdb_backend_t *b,
                                    const char *key,

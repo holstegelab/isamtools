@@ -8,7 +8,7 @@ static void usage(void) {
     fputs(
         "Usage: isamtools update [options] <isam-or-store>\n"
         "\n"
-        "Mutate metadata of a store .isam or alignment-view .isam.\n"
+        "Mutate metadata of a store .ssam or alignment-view .isam.\n"
         "\n"
         "Options:\n"
         "  --name NAME            Set logical alias.\n"
@@ -23,10 +23,9 @@ static void usage(void) {
 }
 
 static char *resolve_isam_path(const char *p) {
-    size_t n = strlen(p);
-    if (n >= 5 && strcmp(p + n - 5, ".isam") == 0)
+    if (isam_is_view_index_path(p) || isam_is_store_index_path(p))
         return xstrdup(p);
-    return isam_index_path_for(p);
+    return isam_store_index_path_for(p);
 }
 
 int cmd_update(int argc, char **argv) {
@@ -80,7 +79,7 @@ int cmd_update(int argc, char **argv) {
     if (stat(isam_path, &st) != 0)
         die("stat '%s': %s", isam_path, strerror(errno));
     if (S_ISDIR(st.st_mode))
-        die("'%s' is a directory; LMDB .isam files are file-backed", isam_path);
+        die("'%s' is a directory; LMDB index files are file-backed", isam_path);
     lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
     lmdb_backend_begin(lmdb);
     for (size_t i = 0; i < n_ops; ++i) {

@@ -12,7 +12,8 @@ and the execution path taken by the main commands:
 For the proposed tag ownership, fallback, and comparison model, see
 `docs/tag-policy-design.md`.
 
-The project is now LMDB-only. A `.isam` path is a file-backed LMDB environment
+The project is now LMDB-only. A store `.ssam` or view `.isam` path is a
+file-backed LMDB environment
 opened with `MDB_NOSUBDIR`, and LMDB creates the sibling lock file
 `<path>-lock` while the environment exists.
 
@@ -30,7 +31,7 @@ the original BAM/CRAM.
 
 The broad rule is:
 
-- Store `.isam`: owns canonical read identity.
+- Store `.ssam`: owns canonical read identity.
 - View `.isam`: owns per-alignment state and optional view-local read annotations/subsets.
 - `view`: reconstructs by reading the view, then fetching canonical payload from
   the store by `store_read_id`.
@@ -90,7 +91,7 @@ multiple alignments from the same read.
 
 ### Metadata DBI
 
-Every `.isam` has a `meta` DBI containing string key/value metadata such as:
+Every `.ssam`/`.isam` has a `meta` DBI containing string key/value metadata such as:
 
 - `isam_type`: `store` or `alignment`
 - `isam_version`
@@ -114,7 +115,7 @@ Canonical store indexes use:
   - key: `(qname_hash, qname)`
   - value: 8-byte `read_id`
 
-Store `.isam` files may also carry post-index read-level annotations:
+Store `.ssam` files may also carry post-index read-level annotations:
 
 - `read_tag`
   - key: `(read_id, tag)`
@@ -235,7 +236,7 @@ Primary input:
 
 Primary output:
 
-- store `.isam` LMDB
+- store `.ssam` LMDB
 
 Execution path:
 
@@ -288,7 +289,7 @@ Primary inputs:
 
 - alignment SAM/BAM/CRAM
 - canonical store BAM/CRAM
-- canonical store `.isam`
+- canonical store `.ssam`
 
 Primary output:
 
@@ -348,7 +349,7 @@ Purpose: reconstruct records overlapping one genomic interval.
 Primary inputs:
 
 - alignment-view `.isam`
-- linked canonical store BAM/CRAM plus store `.isam`
+- linked canonical store BAM/CRAM plus store `.ssam`
 - optional BED file or subset filter layered on top
 
 Primary output:
@@ -417,12 +418,12 @@ Purpose: attach read-level tags or add reads to named subsets.
 
 Primary inputs:
 
-- target store `.isam` or view `.isam`
+- target store `.ssam` or view `.isam`
 - TSV tag file or one-qname-per-line subset file
 
 Primary output:
 
-- updated target `.isam`
+- updated target `.ssam` or `.isam`
 
 Two modes exist.
 
@@ -456,7 +457,7 @@ Why annotations are read-level, not alignment-level:
 
 Store-side annotation status:
 
-- annotating a store `.isam` is supported
+- annotating a store `.ssam` is supported
 - `cmd_annotate` resolves qnames through `canonical_by_qname` when
   `isam_type=store`
 - this makes store-side subset and read-tag writes cheap
@@ -473,7 +474,7 @@ store index has been rebuilt and read IDs have changed.
 Primary inputs:
 
 - alignment-view `.isam`
-- target store `.isam`
+- target store `.ssam`
 - optionally updated `--store` and `--store-index` metadata
 
 Primary output:

@@ -76,7 +76,7 @@ void view_link_store(view_t *v,
 
     char *sip = store_index_path_override ? xstrdup(store_index_path_override)
                         : view_meta_get(v, "store_index_path");
-    if (!sip) sip = isam_index_path_for(sp);
+    if (!sip) sip = isam_store_index_path_for(sp);
 
     v->store = store_open(sp, sip);
     free(sp); free(sip);

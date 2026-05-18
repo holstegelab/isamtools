@@ -12,7 +12,7 @@ static void usage(void) {
         "\n"
         "Options:\n"
         "  --store PATH         Update/use canonical store path metadata.\n"
-        "  --store-index PATH   Use canonical store .isam (default from view).\n"
+        "  --store-index PATH   Use canonical store .ssam (default from view).\n"
         "  -h, --help           Show this help.\n",
         stderr);
 }
@@ -56,7 +56,7 @@ int cmd_rehint(int argc, char **argv) {
                                                : store_idx_meta;
     char *store_idx_alloc = NULL;
     if (!store_idx && store_path) {
-        store_idx_alloc = isam_index_path_for(store_path);
+        store_idx_alloc = isam_store_index_path_for(store_path);
         store_idx = store_idx_alloc;
     }
     if (!store_idx)
@@ -65,7 +65,7 @@ int cmd_rehint(int argc, char **argv) {
     lmdb_backend_t *store = lmdb_backend_open(store_idx, /*readonly*/1, 0);
     char *store_type = lmdb_backend_meta_get(store, "isam_type");
     if (!store_type || strcmp(store_type, "store") != 0)
-        die("'%s' is not a store index .isam (type=%s)",
+        die("'%s' is not a store index .ssam (type=%s)",
             store_idx, store_type ? store_type : "<missing>");
     free(store_type);
 

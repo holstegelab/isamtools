@@ -8,9 +8,9 @@
 
 static void usage(void) {
     fputs(
-        "Usage: isamtools sort [options] <file.isam|store.bam|store.cram>\n"
+        "Usage: isamtools sort [options] <file.isam|store.ssam|store.bam|store.cram>\n"
         "\n"
-        "Build logical indexes for an alignment .isam (or rebuild store indexes).\n"
+        "Build logical indexes for an alignment .isam or canonical store .ssam.\n"
         "\n"
         "Options:\n"
         "  -n             Build name index only.\n"
@@ -21,12 +21,11 @@ static void usage(void) {
         stderr);
 }
 
-/* Resolve user path to an actual .isam path. */
+/* Resolve user path to an actual LMDB index path. */
 static char *resolve_isam_path(const char *p) {
-    size_t n = strlen(p);
-    if (n >= 5 && strcmp(p + n - 5, ".isam") == 0)
+    if (isam_is_view_index_path(p) || isam_is_store_index_path(p))
         return xstrdup(p);
-    return isam_index_path_for(p);
+    return isam_store_index_path_for(p);
 }
 
 #define LMDB_CHECKPOINT_MIN_SPAN 200
@@ -123,7 +122,7 @@ int cmd_sort_main(int argc, char **argv) {
     if (stat(isam_path, &st) != 0)
         die("stat '%s': %s", isam_path, strerror(errno));
     if (S_ISDIR(st.st_mode))
-        die("'%s' is a directory; LMDB .isam files are file-backed", isam_path);
+        die("'%s' is a directory; LMDB index files are file-backed", isam_path);
     lmdb_backend_t *lmdb = lmdb_backend_open(isam_path, /*readonly*/0, 0);
     char *type = lmdb_backend_meta_get(lmdb, "isam_type");
     int rc;
@@ -134,7 +133,7 @@ int cmd_sort_main(int argc, char **argv) {
     } else if (type && strcmp(type, "alignment") == 0) {
         rc = sort_view_lmdb(lmdb, do_coord, do_name, do_interval);
     } else {
-        die("'%s' is not a valid LMDB .isam (type=%s)",
+        die("'%s' is not a valid LMDB index (type=%s)",
             isam_path, type ? type : "<missing>");
     }
     free(type);

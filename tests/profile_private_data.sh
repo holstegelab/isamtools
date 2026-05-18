@@ -88,5 +88,5 @@ if [[ -n $region ]]; then
     printf 'region\t%s\n' "$region"
 fi
 
-printf 'canonical_isam\t%s\n' "$WORK/canonical.sub.isam"
+printf 'canonical_ssam\t%s\n' "$WORK/canonical.sub.ssam"
 printf 'alignment_isam\t%s\n' "$WORK/alignment.sub.isam"

@@ -38,6 +38,14 @@ isamtools view [options] <view.isam> [region]
 - `-l STR`: require library `STR`, resolved through the output header `@RG ID -> LB`.
 - `-d TAG[:VALUE]`: require an aux tag, optionally with a matching value.
 - `-D TAG:PATH`: require an aux tag whose value appears in `PATH`.
+- `--subsample F`: keep fraction `F` of reads, from `0` to `1`.
+- `--subsample-seed INT`: seed used by `--subsample`.
+- `-s INT.FRAC`: samtools-compatible shorthand for `--subsample 0.FRAC --subsample-seed INT`.
+- `-x TAGS`, `--remove-tag TAGS`: strip comma-separated aux tags from output.
+  `-x ^TAGS` preserves only those tags, matching samtools shorthand.
+- `--keep-tag TAGS`: preserve only comma-separated aux tags in output.
+- `-p`, `--unmap`: emit records not selected by filters/regions with the
+  `UNMAP` flag set instead of dropping them.
 - `-c, --count`: count records instead of emitting them.
 - `-o, --output PATH`: output path. Defaults to stdout.
 - `-S`, `--no-PG`, and `-?` are accepted for `samtools view` compatibility.
@@ -66,5 +74,8 @@ isamtools view -c -L targets.bed sample.hg38.isam
 isamtools view -c -N qnames.txt -r rg1 sample.hg38.isam chr1:1-100000 chr2:1-100000
 isamtools view -P sample.hg38.isam chr1:1000000-2000000
 isamtools view -c -F 2304 -q 20 sample.hg38.isam
+isamtools view --subsample 0.1 --subsample-seed 42 sample.hg38.isam
+isamtools view -x MM,ML sample.hg38.isam
+isamtools view -p sample.hg38.isam chr1:1000000-2000000
 isamtools view --subset hifi sample.hg38.isam chr1:1-100000
 ```

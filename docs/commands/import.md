@@ -13,7 +13,7 @@ Required options:
 Optional:
 
 - `--aln PATH`: output alignment-view `.isam`. Defaults to `<input-root>.isam`.
-- `--store-index PATH`: store index path. Defaults to `<store-root>.isam`.
+- `--store-index PATH`: store index path. Defaults to `<store-root>.ssam`.
 - `--name NAME`: logical alias for the view.
 - `--carry-tags TAGS`: store comma-separated source tags once per read.
 - `--keep-alignment-tags TAGS`: keep comma-separated source tags inline per alignment.
@@ -38,7 +38,7 @@ secondary alignments in the canonical BAM/CRAM, `import` will report it as
 missing unless `--allow-missing` is used.
 
 The default store-index path replaces a trailing `.bam`, `.cram`, or `.sam`
-with `.isam`. For example, `sample.chm13.bam` uses `sample.chm13.isam`.
+with `.ssam`. For example, `sample.chm13.bam` uses `sample.chm13.ssam`.
 
 If a previous `import` failed and left an incomplete output `.isam`, rerunning
 the same command will remove that incomplete file and recreate it.

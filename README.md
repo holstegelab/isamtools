@@ -11,7 +11,7 @@ Existing htslib-based tools (assemblers, variant callers, …) can read `.isam`
 files directly via a thin compatibility shim — in most cases with no source
 changes at all. See [docs/htslib-compat-migration.md](docs/htslib-compat-migration.md).
 
-`isamtools index` builds a compact LMDB index (`.isam`) over the first
+`isamtools index` builds a compact LMDB store index (`.ssam`) over the first
 (canonical) BAM/CRAM, recording QNAME, placement hints, and a BGZF virtual
 offset into the BAM for each read. The original BAM/CRAM is kept and remains
 the source of SEQ/QUAL — nothing is re-encoded in LMDB.
@@ -29,7 +29,7 @@ original BAM/CRAM via the stored offset.
 # Build once (downloads and statically links htslib + LMDB, and vendors bzip2)
 make
 
-# 1. Index the canonical store (keeps sample.chm13.bam; builds sample.chm13.isam)
+# 1. Index the canonical store (keeps sample.chm13.bam; builds sample.chm13.ssam)
 isamtools index sample.chm13.bam
 
 
@@ -78,9 +78,10 @@ isamtools audit-tags sample.chm13.bam
 
 ### Named subsets
 
-A subset is a named list of QNAMEs stored inside the `.isam`. `view --subset`
-checks the alignment view first and then falls back to the canonical store, so
-store-level subsets can be reused across multiple views.
+A subset is a named list of QNAMEs stored inside an alignment `.isam` or store
+`.ssam`. `view --subset` checks the alignment view first and then falls back to
+the canonical store, so store-level subsets can be reused across multiple
+views.
 
 ```bash
 # Store a list of HiFi read names as the "hifi" subset
@@ -88,7 +89,9 @@ isamtools annotate sample.chm13.bam --subset hifi --from hifi.qnames.txt
 
 # Query only HiFi reads from any alignment view
 isamtools view --subset hifi sample.hg38.isam chr1:1000000-2000000
-isamtools view --subset hifi sample.chm13.isam
+
+# Inspect the canonical store index
+isamtools store_stats sample.chm13.ssam
 ```
 
 Store-level subsets cover all linked views; view-local subsets still work too.
@@ -114,11 +117,12 @@ The canonical BAM/CRAM is kept as the single source of read data.
 | `check` | Verify BAM/CRAM/SAM content against a store or view. |
 | `sort` | Build coordinate, name, and/or interval indexes on a view. |
 | `view` | Reconstruct SAM/BAM records from a view (streaming or region query). |
+| `query` | Select reads and emit multi-source TSV fields. |
 | `annotate` | Add per-read tags or named QNAME subsets. |
 | `store_stats` | Report LMDB table storage and logical payload counts. |
 | `audit-tags` | Report how aux tags in a file will be classified (shared, carried, alignment, or unknown). |
 | `rehint` | Repair `store_read_id` references after a store index rebuild. |
-| `update` | Edit metadata paths and aliases inside an `.isam` file. |
+| `update` | Edit metadata paths and aliases inside a `.ssam` store or `.isam` view. |
 
 **Aux tag classification.** `index --share-tags TAG1,TAG2,...` adds tags to the
 canonical BAM/CRAM reconstruction allow-list, while
