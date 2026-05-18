@@ -52,6 +52,7 @@ target_compile_definitions(lmdb_static PRIVATE MDB_MAXKEYSIZE=0)
 
 set(ISAM_SOURCES
     src/common.c
+    src/aux_tags.c
     src/backend_lmdb.c
     src/hash.c
     src/rebuild.c
@@ -63,6 +64,8 @@ set(ISAM_SOURCES
     src/cmd_sort.c
     src/cmd_view.c
     src/cmd_annotate.c
+    src/cmd_store_stats.c
+    src/cmd_audit_tags.c
     src/cmd_update.c
     src/cmd_rehint.c
     src/api.c
@@ -76,7 +79,8 @@ target_include_directories(isam
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(isam PUBLIC PkgConfig::HTSLIB lmdb_static)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+target_link_libraries(isam PUBLIC PkgConfig::HTSLIB PkgConfig::ZSTD lmdb_static)
 
 add_executable(isamtools src/main.c)
 target_link_libraries(isamtools PRIVATE isam)
@@ -91,7 +95,7 @@ target_include_directories(htsisam
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${LMDB_SOURCE_DIR}
 )
-target_link_libraries(htsisam PUBLIC PkgConfig::HTSLIB)
+target_link_libraries(htsisam PUBLIC PkgConfig::HTSLIB PkgConfig::ZSTD)
 set_target_properties(htsisam PROPERTIES C_VISIBILITY_PRESET default)
 
 install(TARGETS isamtools RUNTIME DESTINATION bin)

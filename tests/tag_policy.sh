@@ -16,6 +16,7 @@ cat > "$WORK/store.sam" <<'SAM'
 @SQ	SN:chrS	LN:1000
 qA	0	chrS	1	60	8M	*	0	0	ACGTACGT	FFFFFFFF	RX:Z:canonA	MN:i:8
 qB	0	chrS	20	60	8M	*	0	0	TTTTCCCC	FFFFFFFF	RX:Z:canonB
+qC	0	chrS	40	60	8M	*	0	0	AAAACCCC	FFFFFFFF	RX:Z:canonC
 SAM
 
 cat > "$WORK/aln.sam" <<'SAM'
@@ -24,12 +25,13 @@ cat > "$WORK/aln.sam" <<'SAM'
 qA	0	chrV	101	30	8M	*	0	0	NNNNNNNN	!!!!!!!!	RX:Z:sourceA	HP:i:1	xx:Z:inline
 qA	2048	chrV	150	10	4M4S	*	0	0	NNNNNNNN	!!!!!!!!	HP:i:2
 qB	0	chrV	200	25	8M	*	0	0	NNNNNNNN	!!!!!!!!
+qC	0	chrV	250	25	8M	*	0	0	NNNNNNNN	!!!!!!!!	RX:Z:canonC
 SAM
 
 samtools view -bS "$WORK/store.sam" -o "$WORK/store.bam"
 
 "$TOOL" index -o "$WORK/store.isam" "$WORK/store.bam" >/dev/null 2>"$WORK/index.err"
-grep -q 'canonical read-level tags shared from store: .*RX' "$WORK/index.err"
+grep -q 'read-level tags observed and reconstructible from canonical BAM/CRAM: .*RX' "$WORK/index.err"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \
@@ -40,10 +42,17 @@ grep -q 'HP: 1 reads with conflicts' "$WORK/import.err"
 
 qa=$("$TOOL" view --no-header "$WORK/view.isam" | awk '$1=="qA" && $2==0 { print; exit }')
 qb=$("$TOOL" view --no-header "$WORK/view.isam" | awk '$1=="qB" { print; exit }')
+qc=$("$TOOL" view --no-header "$WORK/view.isam" | awk '$1=="qC" { print; exit }')
 grep -q $'RX:Z:sourceA' <<<"$qa"
 grep -q $'HP:i:1' <<<"$qa"
 grep -q $'xx:Z:inline' <<<"$qa"
 grep -q $'RX:Z:canonB' <<<"$qb"
+grep -q $'RX:Z:canonC' <<<"$qc"
+
+stats=$("$TOOL" store_stats "$WORK/view.isam")
+grep -q $'^RX\t1\t' <<<"$stats"
+grep -q $'^HP\t1\t' <<<"$stats"
+grep -q $'^xx\t1\t' <<<"$stats"
 
 "$TOOL" import "$WORK/aln.sam" \
     --store "$WORK/store.bam" \

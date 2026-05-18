@@ -115,13 +115,15 @@ The canonical BAM/CRAM is kept as the single source of read data.
 | `sort` | Build coordinate, name, and/or interval indexes on a view. |
 | `view` | Reconstruct SAM/BAM records from a view (streaming or region query). |
 | `annotate` | Add per-read tags or named QNAME subsets. |
+| `store_stats` | Report LMDB table storage and logical payload counts. |
 | `audit-tags` | Report how aux tags in a file will be classified (shared, carried, alignment, or unknown). |
 | `rehint` | Repair `store_read_id` references after a store index rebuild. |
 | `update` | Edit metadata paths and aliases inside an `.isam` file. |
 
 **Aux tag classification.** `index --share-tags TAG1,TAG2,...` adds tags to the
-canonical shared set, while `index --no-share-tags TAG1,TAG2,...` removes tags
-from sharing. `import --carry-tags`, `--keep-alignment-tags`, `--drop-tags`,
+canonical BAM/CRAM reconstruction allow-list, while
+`index --no-share-tags TAG1,TAG2,...` removes tags from that allow-list.
+`import --carry-tags`, `--keep-alignment-tags`, `--drop-tags`,
 and `--drop-source-tags` tune how source tags are stored for one imported view.
 Use `audit-tags` to preview the classification before indexing or importing.
 

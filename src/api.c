@@ -50,6 +50,7 @@ static int record_to_bam(isamFile *fp,
                      rec->pos0, rec->mapq, rec->n_cigar, rec->cigar,
                      rec->mate_tid, rec->mate_pos0, rec->tlen,
                      rec->aux, rec->aux_len);
+    lmdb_read_aux_apply(fp->v->lmdb, rec->store_read_id, b, 0);
     lmdb_read_tags_apply(fp->v->lmdb, rec->store_read_id, b, 0);
     isam_aux_tags_append_missing_from(fp->canon, b,
                                       &fp->shared_tags,

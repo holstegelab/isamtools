@@ -39,11 +39,33 @@ static hts_pos_t cigar_ref_span(int n_cigar, const uint32_t *cigar) {
     return span;
 }
 
+static uint8_t nt16_complement(uint8_t base) {
+    static const uint8_t comp[16] = {
+        0, 8, 4, 12, 2, 10, 6, 14,
+        1, 9, 5, 13, 3, 11, 7, 15
+    };
+    return comp[base & 0xf];
+}
+
 static void copy_seq_slice(uint8_t *dst, const uint8_t *src,
-                           int start, int len) {
+                           int start, int len, int reverse) {
     memset(dst, 0, (size_t)((len + 1) / 2));
+    for (int i = 0; i < len; ++i) {
+        int src_i = reverse ? start + len - 1 - i : start + i;
+        uint8_t base = bam_seqi(src, src_i);
+        bam_set_seqi(dst, i, reverse ? nt16_complement(base) : base);
+    }
+}
+
+static void copy_qual_slice(uint8_t *dst, const uint8_t *src,
+                            int start, int len, int reverse) {
+    if (!reverse) {
+        memcpy(dst, src + start, (size_t)len);
+        return;
+    }
+
     for (int i = 0; i < len; ++i)
-        bam_set_seqi(dst, i, bam_seqi(src, start + i));
+        dst[i] = src[start + len - 1 - i];
 }
 
 void isam_rebuild_bam(bam1_t *out, const bam1_t *canonical,
@@ -62,11 +84,12 @@ void isam_rebuild_bam(bam1_t *out, const bam1_t *canonical,
     int canonical_qlen = canonical->core.l_qseq;
     int out_qlen = canonical_qlen;
     int seq_start = 0;
+    int reverse = ((flag ^ canonical->core.flag) & BAM_FREVERSE) != 0;
 
     if (n_cigar > 0 && cigar_qlen != canonical_qlen) {
         if (cigar_qlen >= 0 &&
             leading_hclip + cigar_qlen + trailing_hclip == canonical_qlen) {
-            seq_start = leading_hclip;
+            seq_start = reverse ? trailing_hclip : leading_hclip;
             out_qlen = cigar_qlen;
         } else {
             die("view CIGAR query length (%d) is incompatible with canonical "
@@ -93,9 +116,9 @@ void isam_rebuild_bam(bam1_t *out, const bam1_t *canonical,
         p += (size_t)n_cigar * 4;
     }
 
-    copy_seq_slice(p, bam_get_seq(canonical), seq_start, out_qlen);
+    copy_seq_slice(p, bam_get_seq(canonical), seq_start, out_qlen, reverse);
     p += seq_bytes;
-    memcpy(p, bam_get_qual(canonical) + seq_start, (size_t)out_qlen);
+    copy_qual_slice(p, bam_get_qual(canonical), seq_start, out_qlen, reverse);
     p += out_qlen;
     if (aux_len > 0) memcpy(p, aux, (size_t)aux_len);
 

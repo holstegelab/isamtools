@@ -209,6 +209,7 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                      rec->n_cigar, rec->cigar,
                      rec->mate_tid, rec->mate_pos0, rec->tlen,
                      rec->aux, rec->aux_len);
+    lmdb_read_aux_apply(v->lmdb, rec->store_read_id, out_buf, 0);
     lmdb_read_tags_apply(v->lmdb, rec->store_read_id, out_buf, 0);
     isam_aux_tags_append_missing_from(canon_buf, out_buf, shared_tags, dropped_tags);
     lmdb_read_tags_apply(v->store->lmdb, rec->store_read_id, out_buf, 0);
@@ -360,26 +361,44 @@ int cmd_view(int argc, char **argv) {
     lmdb_view_iter_kind_t iter_kind = LMDB_VIEW_ITER_IMPORT;
     int tid = -1;
     int64_t beg = 0, end = 0;
+    int unmapped_region = 0;
     if (region) {
-        hts_pos_t hbeg = 0, hend = HTS_POS_MAX;
-        const char *tail = sam_parse_region(v->hdr, region, &tid,
-                                            &hbeg, &hend, 0);
-        if (!tail || tid < 0) die("invalid region: '%s'", region);
-        int64_t has_iv = 0;
-        view_meta_get_i64(v, "indexed_interval", &has_iv);
-        if (!has_iv)
-            die("alignment view has no LMDB interval index; "
-                "run `isamtools sort --interval %s`", isam_path);
-        beg = (int64_t)hbeg;
-        end = (int64_t)hend;
-        iter_kind = LMDB_VIEW_ITER_REGION;
+        if (strcmp(region, "*") == 0) {
+            int64_t has_coord = 0;
+            view_meta_get_i64(v, "indexed_coord", &has_coord);
+            if (!has_coord)
+                die("alignment view has no LMDB coordinate index; "
+                    "run `isamtools sort %s`", isam_path);
+            if (bed_path)
+                die("cannot combine '*' unmapped region with -L/--targets-file");
+            unmapped_region = 1;
+            iter_kind = LMDB_VIEW_ITER_UNMAPPED;
+        } else {
+            hts_pos_t hbeg = 0, hend = HTS_POS_MAX;
+            const char *tail = sam_parse_region(v->hdr, region, &tid,
+                                                &hbeg, &hend, 0);
+            if (!tail || tid < 0) die("invalid region: '%s'", region);
+            int64_t has_iv = 0;
+            view_meta_get_i64(v, "indexed_interval", &has_iv);
+            if (!has_iv)
+                die("alignment view has no LMDB interval index; "
+                    "run `isamtools sort --interval %s`", isam_path);
+            beg = (int64_t)hbeg;
+            end = (int64_t)hend;
+            iter_kind = LMDB_VIEW_ITER_REGION;
+        }
     }
 
     if (have_subset && !subset_from_store && (bed_path || region)) {
         lmdb_view_iter_t *it = lmdb_view_iter_open_subset(v->lmdb, subset_id);
         lmdb_view_record_t rec;
         while (lmdb_view_iter_next(it, &rec)) {
-            if (region && !(rec.tid == tid && rec.pos0 < end && rec.end0 > beg)) {
+            if (unmapped_region && !rec.is_unmapped) {
+                lmdb_view_record_clear(&rec);
+                continue;
+            }
+            if (region && !unmapped_region &&
+                !(rec.tid == tid && rec.pos0 < end && rec.end0 > beg)) {
                 lmdb_view_record_clear(&rec);
                 continue;
             }

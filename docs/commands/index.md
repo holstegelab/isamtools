@@ -10,8 +10,10 @@ isamtools index [options] <store.bam|store.cram>
 
 - `--name NAME`: set a logical alias for the store.
 - `-o, --output PATH`: write the index to `PATH` instead of `<store-root>.isam`.
-- `--share-tags TAGS`: add comma-separated aux tags to the canonical shared set.
-- `--no-share-tags TAGS`: remove comma-separated aux tags from canonical sharing.
+- `--share-tags TAGS`: add comma-separated aux tags to canonical
+  reconstruction from the BAM/CRAM payload.
+- `--no-share-tags TAGS`: remove comma-separated aux tags from canonical
+  reconstruction.
 - `--strict-tag-policy`: fail when unknown canonical tags are unresolved.
 - `--verbose-tag-policy`: print the detailed tag policy summary.
 - `--yes`: accept tag policy warnings.
@@ -34,10 +36,11 @@ lock file named `<path>-lock` while the environment is in use.
 
 LMDB output paths must not already exist.
 
-The index records observed canonical shared tags in store metadata. Shared tags
-can be reconstructed from the canonical BAM/CRAM payload during `view` when an
-imported alignment file does not provide its own value. Unknown canonical tags
-are reported but are not shared unless selected with `--share-tags`.
+The index records observed canonical reconstructible tags in store metadata.
+Those aux values are not copied into the `.isam`; they are read from the
+canonical BAM/CRAM payload during `view` when an imported alignment file does
+not provide its own value. Unknown canonical tags are reported but are not
+reconstructed unless selected with `--share-tags`.
 
 `index` prints the intended tag-policy behavior before scanning, then prints an
 observed tag summary at the end. The observed summary only lists tags that were

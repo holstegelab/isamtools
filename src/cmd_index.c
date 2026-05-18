@@ -21,8 +21,8 @@ static void usage(void) {
         "\n"
         "Options:\n"
         "  --name NAME      Logical alias for this store (e.g. chm13).\n"
-        "  --share-tags TAGS     Comma-separated aux tags shared from the canonical store.\n"
-        "  --no-share-tags TAGS  Comma-separated aux tags excluded from canonical sharing.\n"
+        "  --share-tags TAGS     Aux tags reconstructed from canonical BAM/CRAM when missing.\n"
+        "  --no-share-tags TAGS  Aux tags excluded from canonical reconstruction.\n"
         "  --strict-tag-policy   Fail when unknown canonical tags are unresolved.\n"
         "  --verbose-tag-policy  Print a detailed tag policy summary.\n"
         "  --yes                 Accept tag policy warnings.\n"
@@ -67,6 +67,7 @@ KHASH_SET_INIT_STR(strset)
 typedef struct canonical_state {
     int64_t read_id;
     int is_supplementary;
+    int is_unmapped;
 } canonical_state_t;
 
 KHASH_MAP_INIT_STR(canonical_map, canonical_state_t)
@@ -81,6 +82,8 @@ typedef struct index_stats {
     int64_t n_supplementary_fallback_reads;
     int64_t n_supplementary_hard_clip_only_reads;
     int64_t n_indexed_records;
+    int64_t n_indexed_mapped_reads;
+    int64_t n_indexed_unmapped_reads;
     int64_t n_primary_upgrades;
     int64_t n_active_supplementary_records;
 } index_stats_t;
@@ -147,7 +150,8 @@ static canonical_state_t *canonical_map_get(khash_t(canonical_map) *map,
 static canonical_state_t *canonical_map_put(khash_t(canonical_map) *map,
                                             const char *qname,
                                             int64_t read_id,
-                                            int is_supplementary) {
+                                            int is_supplementary,
+                                            int is_unmapped) {
     khiter_t iter = kh_get(canonical_map, map, qname);
     if (iter == kh_end(map)) {
         char *owned = xstrdup(qname);
@@ -160,6 +164,7 @@ static canonical_state_t *canonical_map_put(khash_t(canonical_map) *map,
     }
     kh_value(map, iter).read_id = read_id;
     kh_value(map, iter).is_supplementary = is_supplementary;
+    kh_value(map, iter).is_unmapped = is_unmapped;
     return &kh_value(map, iter);
 }
 
@@ -215,6 +220,51 @@ static void maybe_report_progress(lmdb_backend_t *lmdb,
             (long long)stats->n_primary_upgrades);
 }
 
+static uint64_t dbi_page_bytes(MDB_txn *txn, MDB_dbi dbi, size_t page_size) {
+    if (!dbi)
+        return 0;
+    MDB_stat st;
+    int rc = mdb_stat(txn, dbi, &st);
+    if (rc)
+        die("mdb_stat: %s", mdb_strerror(rc));
+    uint64_t pages = (uint64_t)st.ms_branch_pages +
+                     (uint64_t)st.ms_leaf_pages +
+                     (uint64_t)st.ms_overflow_pages;
+    return pages * (uint64_t)page_size;
+}
+
+static uint64_t lmdb_page_bytes(lmdb_backend_t *lmdb) {
+    MDB_stat env_st;
+    int rc = mdb_env_stat(lmdb->env, &env_st);
+    if (rc)
+        die("mdb_env_stat: %s", mdb_strerror(rc));
+
+    MDB_txn *txn = NULL;
+    rc = mdb_txn_begin(lmdb->env, NULL, MDB_RDONLY, &txn);
+    if (rc)
+        die("txn_begin: %s", mdb_strerror(rc));
+    uint64_t bytes = 0;
+    bytes += dbi_page_bytes(txn, lmdb->meta, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->canonical_by_id, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->canonical_by_qname, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->read_by_id, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->read_by_qname, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_by_id, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_import_by_order, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_by_coord, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_unmapped, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_by_read, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_by_bin, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->aln_checkpoint, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->subset_by_name, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->subset_read, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->read_aux_by_id, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->read_tag, env_st.ms_psize);
+    bytes += dbi_page_bytes(txn, lmdb->annotation_meta, env_st.ms_psize);
+    mdb_txn_abort(txn);
+    return bytes;
+}
+
 static int index_lmdb(const char *store_path, const char *out_path,
                       const char *name_alias, samFile *input,
                       sam_hdr_t *hdr, int is_bam,
@@ -262,16 +312,24 @@ static int index_lmdb(const char *store_path, const char *out_path,
                              NULL, NULL);
     char *no_shared_tags = isam_tag_set_join_csv(&classifier.no_share_tags);
     char *user_shared_tags = isam_tag_set_join_csv(&classifier.configured_shared_tags);
+    char *header_shared_tags = isam_tag_set_join_csv(&classifier.header_shared_tags);
+    char *effective_shared_tags = isam_tag_set_join_csv(&classifier.effective_shared_tags);
     lmdb_store_put_meta(lmdb, "no_share_tags", no_shared_tags);
     lmdb_store_put_meta(lmdb, "share_tags_user_added", user_shared_tags);
     lmdb_store_put_meta(lmdb, "tag_policy_version", "1");
     fprintf(stderr, "isamtools index: tag policy before scanning\n");
     fprintf(stderr, "  store file: %s\n", store_path);
-    fprintf(stderr, "  canonical read-level tags will be shared when observed\n");
-    fprintf(stderr, "  canonical alignment-only tags stay in the source BAM/CRAM payload\n");
+    fprintf(stderr, "  canonical aux storage: not copied into the .isam; reconstructed from the canonical BAM/CRAM payload when needed\n");
+    fprintf(stderr, "  read-level reconstruction candidates from policy/header: %s\n",
+            effective_shared_tags[0] ? effective_shared_tags : "none");
+    fprintf(stderr, "  header-declared read-level candidates: %s\n",
+            header_shared_tags[0] ? header_shared_tags : "none");
+    fprintf(stderr, "  tags explicitly added by user: %s\n",
+            user_shared_tags[0] ? user_shared_tags : "none");
+    fprintf(stderr, "  canonical alignment-only tags stay only in the source BAM/CRAM payload\n");
     fprintf(stderr, "  tags excluded from sharing by user request: %s\n",
             no_shared_tags[0] ? no_shared_tags : "none");
-    fprintf(stderr, "  final observed tag summary will be printed after the scan\n");
+    fprintf(stderr, "  note: SAM/BAM headers do not generally enumerate every aux tag; observed tag statistics are printed after the scan\n");
 
     bam1_t *b = bam_init1();
     int64_t max_read_len = 0;
@@ -364,8 +422,10 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 .has_voffset = (have_voffset && voffset >= 0) ? 1 : 0
             };
             lmdb_store_put_record(lmdb, &rec);
-            canonical_map_put(canonical_reads, qname, read_id, 1);
+            canonical_map_put(canonical_reads, qname, read_id, 1, is_unmapped);
             ++stats.n_indexed_records;
+            if (is_unmapped) ++stats.n_indexed_unmapped_reads;
+            else ++stats.n_indexed_mapped_reads;
             ++stats.n_active_supplementary_records;
         } else {
             ++stats.n_primary_records;
@@ -379,13 +439,17 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 die("multiple primary canonical records for '%s' in '%s'",
                     qname, store_path);
 
+            int is_unmapped = (b->core.flag & BAM_FUNMAP) ? 1 : 0;
             if (state && state->is_supplementary) {
                 ++stats.n_primary_upgrades;
                 --stats.n_active_supplementary_records;
+                if (state->is_unmapped) --stats.n_indexed_unmapped_reads;
+                else --stats.n_indexed_mapped_reads;
+                if (is_unmapped) ++stats.n_indexed_unmapped_reads;
+                else ++stats.n_indexed_mapped_reads;
             }
             strset_remove(hardclip_only_qnames, qname);
 
-            int is_unmapped = (b->core.flag & BAM_FUNMAP) ? 1 : 0;
             lmdb_store_record_t rec = {
                 .read_id = read_id,
                 .qname = (char *)qname,
@@ -401,10 +465,13 @@ static int index_lmdb(const char *store_path, const char *out_path,
             if (state && state->is_supplementary) {
                 lmdb_store_update_record(lmdb, &rec);
                 state->is_supplementary = 0;
+                state->is_unmapped = is_unmapped;
             } else {
                 lmdb_store_put_record(lmdb, &rec);
-                canonical_map_put(canonical_reads, qname, read_id, 0);
+                canonical_map_put(canonical_reads, qname, read_id, 0, is_unmapped);
                 ++stats.n_indexed_records;
+                if (is_unmapped) ++stats.n_indexed_unmapped_reads;
+                else ++stats.n_indexed_mapped_reads;
             }
         }
 
@@ -430,6 +497,7 @@ static int index_lmdb(const char *store_path, const char *out_path,
     if (unknown_csv[0] && strict_tag_policy && !yes)
         die("index: unknown canonical aux tags are not shared: %s", unknown_csv);
     lmdb_backend_commit(lmdb);
+    uint64_t page_bytes = lmdb_page_bytes(lmdb);
 
     stats.n_supplementary_fallback_reads = lmdb_store_count_supplementary_records(lmdb);
     if (stats.n_supplementary_fallback_reads != stats.n_active_supplementary_records)
@@ -439,6 +507,8 @@ static int index_lmdb(const char *store_path, const char *out_path,
         (int64_t)kh_size(hardclip_only_qnames);
     lmdb_backend_close(lmdb);
 
+    if (stats.n_alignment_records >= 10000)
+        fputc('\n', stderr);
     if (stats.n_supplementary_fallback_reads > 0)
         warnx_("index: used supplementary alignments as canonical records for %lld reads without a primary alignment",
                (long long)stats.n_supplementary_fallback_reads);
@@ -452,15 +522,15 @@ static int index_lmdb(const char *store_path, const char *out_path,
         warnx_("index: canonical aux tags excluded from sharing by user request: %s",
                excluded_seen_csv);
     fprintf(stderr, verbose_tag_policy
-            ? "isamtools index: observed tag policy summary\n"
-            : "isamtools index: observed tag policy\n");
-    fprintf(stderr, "  canonical read-level tags shared from store: %s\n",
+            ? "isamtools index: observed canonical aux statistics\n"
+            : "isamtools index: observed canonical aux stats\n");
+    fprintf(stderr, "  read-level tags observed and reconstructible from canonical BAM/CRAM: %s\n",
             shared_tags[0] ? shared_tags : "none");
-    fprintf(stderr, "  canonical alignment-only tags left in BAM/CRAM payload: %s\n",
+    fprintf(stderr, "  alignment-only tags observed only in canonical BAM/CRAM payload: %s\n",
             observed_alignment_csv[0] ? observed_alignment_csv : "none");
     fprintf(stderr, "  tags actually excluded from sharing by user request: %s\n",
             excluded_seen_csv[0] ? excluded_seen_csv : "none");
-    fprintf(stderr, "  unknown tags left in BAM/CRAM payload: %s\n",
+    fprintf(stderr, "  unknown tags observed only in canonical BAM/CRAM payload: %s\n",
             unknown_csv[0] ? unknown_csv : "none");
     if (unknown_csv[0])
         fprintf(stderr, "  hint: use --share-tags %s to share unknown canonical tags\n",
@@ -476,6 +546,8 @@ static int index_lmdb(const char *store_path, const char *out_path,
     free(observed_alignment_csv);
     free(no_shared_tags);
     free(user_shared_tags);
+    free(header_shared_tags);
+    free(effective_shared_tags);
     free(unknown_csv);
     free(excluded_seen_csv);
 
@@ -496,6 +568,13 @@ static int index_lmdb(const char *store_path, const char *out_path,
             (long long)stats.n_supplementary_fallback_reads,
             (long long)stats.n_primary_upgrades,
             (long long)max_read_len);
+    fprintf(stderr,
+            "isamtools index: canonical reads by mapping state: %lld mapped, %lld unmapped\n",
+            (long long)stats.n_indexed_mapped_reads,
+            (long long)stats.n_indexed_unmapped_reads);
+    fprintf(stderr,
+            "isamtools index: LMDB storage page bytes: %" PRIu64 "\n",
+            page_bytes);
     return 0;
 }
 

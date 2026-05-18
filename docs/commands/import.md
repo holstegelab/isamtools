@@ -48,8 +48,9 @@ alignment-record DBIs. LMDB creates a sibling lock file named `<path>-lock`
 while the environment is in use.
 
 Tag policy precedence is deterministic: `--drop-tags` suppresses final output,
-then values from the imported alignment file override canonical shared values,
-then missing shared tags can be filled from the canonical store.
+then values from the imported alignment file override canonical-backed values,
+then missing canonical-backed tags can be filled from the canonical BAM/CRAM
+payload.
 `--drop-source-tags` removes only the imported copy, so canonical shared
 fallback can still happen.
 
@@ -57,6 +58,10 @@ Import-carried tags such as `HP` and `PS` are stored once per read. If one
 import contains conflicting values for the same read and tag, the first
 observed value is retained and the conflict is reported; with
 `--strict-tag-policy`, that conflict is an error.
+
+Alignment-local tags such as `SA`, `mc`, and `rm` are stored on each alignment
+record. The import summary separates these from tags stored once per read in
+`read_aux_by_id`.
 
 `import` prints the intended tag-policy behavior before scanning, then prints an
 observed tag summary at the end. The observed summary only lists tags that were

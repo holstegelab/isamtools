@@ -10,6 +10,7 @@ int cmd_view    (int argc, char **argv);
 int cmd_annotate(int argc, char **argv);
 int cmd_update  (int argc, char **argv);
 int cmd_rehint  (int argc, char **argv);
+int cmd_store_stats(int argc, char **argv);
 int cmd_audit_tags(int argc, char **argv);
 
 static void usage(void) {
@@ -23,6 +24,7 @@ static void usage(void) {
         "  sort       Build coordinate / name / interval indexes on a .isam.\n"
         "  view       Emit reconstructed SAM/BAM from a .isam alignment view.\n"
         "  annotate   Add read tags or named subsets to a .isam.\n"
+        "  store_stats Report LMDB table storage and logical payload stats.\n"
         "  audit-tags Inspect observed aux tags and classify their scope.\n"
         "  update     Mutate metadata of a .isam.\n"
         "  rehint     Re-resolve alignment-view store_read_id values by QNAME.\n"
@@ -43,6 +45,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sort"))     return cmd_sort    (sub_argc, sub_argv);
     if (!strcmp(cmd, "view"))     return cmd_view    (sub_argc, sub_argv);
     if (!strcmp(cmd, "annotate")) return cmd_annotate(sub_argc, sub_argv);
+    if (!strcmp(cmd, "store_stats")) return cmd_store_stats(sub_argc, sub_argv);
     if (!strcmp(cmd, "audit-tags")) return cmd_audit_tags(sub_argc, sub_argv);
     if (!strcmp(cmd, "update"))   return cmd_update  (sub_argc, sub_argv);
     if (!strcmp(cmd, "rehint"))   return cmd_rehint  (sub_argc, sub_argv);

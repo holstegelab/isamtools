@@ -181,6 +181,7 @@ int isam_check_view_against_bam(const char *input_path,
                          rec.n_cigar, rec.cigar,
                          rec.mate_tid, rec.mate_pos0, rec.tlen,
                          rec.aux, rec.aux_len);
+        lmdb_read_aux_apply(v->lmdb, rec.store_read_id, view_b, 0);
         lmdb_read_tags_apply(v->lmdb, rec.store_read_id, view_b, 0);
         isam_aux_tags_append_missing_from(canon_b, view_b,
                                           &shared_tags, &dropped_tags);

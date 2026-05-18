@@ -22,10 +22,21 @@ typedef struct lmdb_backend {
     MDB_dbi aln_checkpoint;
     MDB_dbi subset_by_name;
     MDB_dbi subset_read;
+    MDB_dbi read_aux_by_id;
     MDB_dbi read_tag;
     MDB_dbi annotation_meta;
     char *path;
     int readonly;
+    uint8_t *read_aux_zstd_dict;
+    size_t read_aux_zstd_dict_len;
+    uint8_t *view_record_zstd_dict;
+    size_t view_record_zstd_dict_len;
+    uint8_t *view_record_zstd_samples;
+    size_t view_record_zstd_samples_len;
+    size_t view_record_zstd_samples_cap;
+    size_t view_record_zstd_sample_sizes[1000];
+    unsigned view_record_zstd_sample_count;
+    int view_record_zstd_training_done;
 } lmdb_backend_t;
 
 typedef struct lmdb_store_record {
@@ -66,7 +77,8 @@ typedef enum lmdb_view_iter_kind {
     LMDB_VIEW_ITER_NAME = 2,
     LMDB_VIEW_ITER_REGION = 3,
     LMDB_VIEW_ITER_READ_ID = 4,
-    LMDB_VIEW_ITER_SUBSET = 5
+    LMDB_VIEW_ITER_SUBSET = 5,
+    LMDB_VIEW_ITER_UNMAPPED = 6
 } lmdb_view_iter_kind_t;
 
 typedef struct lmdb_view_iter lmdb_view_iter_t;
@@ -159,6 +171,23 @@ void            lmdb_read_tags_apply(lmdb_backend_t *b,
                                      int64_t read_id,
                                      bam1_t *record,
                                      int overwrite_existing);
+int             lmdb_read_aux_get(lmdb_backend_t *b,
+                                  int64_t read_id,
+                                  uint8_t **aux,
+                                  size_t *aux_len);
+void            lmdb_read_aux_put(lmdb_backend_t *b,
+                                  int64_t read_id,
+                                  const uint8_t *aux,
+                                  size_t aux_len);
+void            lmdb_read_aux_apply(lmdb_backend_t *b,
+                                    int64_t read_id,
+                                    bam1_t *record,
+                                    int overwrite_existing);
+int             lmdb_read_aux_set_zstd_dict(lmdb_backend_t *b,
+                                            const void *samples_buffer,
+                                            const size_t *sample_sizes,
+                                            unsigned sample_count,
+                                            size_t max_dict_bytes);
 int64_t         lmdb_store_count_supplementary_records(lmdb_backend_t *b);
 void            lmdb_annotation_meta_put(lmdb_backend_t *b,
                                          const char *kind,

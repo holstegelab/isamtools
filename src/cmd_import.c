@@ -9,6 +9,7 @@
 #include <htslib/khash.h>
 #include <htslib/kstring.h>
 #include <getopt.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -47,6 +48,13 @@ typedef struct tag_count {
     int64_t count;
 } tag_count_t;
 
+typedef struct read_aux_dict_trainer {
+    kstring_t samples;
+    size_t sample_sizes[1000];
+    unsigned sample_count;
+    int trained;
+} read_aux_dict_trainer_t;
+
 static void tag_count_inc(tag_count_t **items, size_t *n, size_t *cap,
                           const char tag[2]) {
     uint16_t code = isam_tag_code(tag);
@@ -69,9 +77,9 @@ static uint64_t read_tag_seen_key(int64_t read_id, const char tag[2]) {
     return ((uint64_t)read_id << 16) | (uint64_t)isam_tag_code(tag);
 }
 
-static int tag_conflict_seen_add(khash_t(u64set) *set,
-                                 int64_t read_id,
-                                 const char tag[2]) {
+static int read_tag_seen_add(khash_t(u64set) *set,
+                             int64_t read_id,
+                             const char tag[2]) {
     int absent = 0;
     khiter_t iter = kh_put(u64set, set, read_tag_seen_key(read_id, tag), &absent);
     if (absent < 0)
@@ -80,24 +88,85 @@ static int tag_conflict_seen_add(khash_t(u64set) *set,
     return absent;
 }
 
-static int read_tag_value_matches(lmdb_backend_t *lmdb,
+static int read_tag_seen_contains(khash_t(u64set) *set,
                                   int64_t read_id,
-                                  const char tag[2],
-                                  char type,
-                                  const void *value,
-                                  size_t value_len,
-                                  int *present) {
-    char old_type = 0;
-    uint8_t *old_value = NULL;
-    size_t old_len = 0;
-    *present = lmdb_read_tag_get(lmdb, read_id, tag, &old_type, &old_value, &old_len);
-    if (!*present)
+                                  const char tag[2]) {
+    return kh_get(u64set, set, read_tag_seen_key(read_id, tag)) != kh_end(set);
+}
+
+static int aux_field_value_matches(const uint8_t *field,
+                                   char type,
+                                   const void *value,
+                                   size_t value_len) {
+    if (!field)
         return 0;
-    int same = old_type == type &&
-               old_len == value_len &&
-               (old_len == 0 || memcmp(old_value, value, old_len) == 0);
-    free(old_value);
-    return same;
+    int payload_len = isam_aux_field_payload_len(field);
+    if (payload_len < 0)
+        die("invalid canonical aux tag while comparing import tags");
+    return bam_aux_type(field) == type &&
+           (size_t)payload_len == value_len &&
+           (value_len == 0 || memcmp(field + 1, value, value_len) == 0);
+}
+
+static const uint8_t *aux_blob_find_field(const uint8_t *aux,
+                                          size_t aux_len,
+                                          const char tag[2]) {
+    const uint8_t *p = aux;
+    const uint8_t *end = aux + aux_len;
+    while (p < end) {
+        if (p + 3 > end)
+            die("truncated read aux blob");
+        const uint8_t *field = p + 2;
+        int payload_len = isam_aux_field_payload_len(field);
+        if (payload_len < 0 || p + 3 + payload_len > end)
+            die("corrupt read aux blob");
+        if (p[0] == (uint8_t)tag[0] && p[1] == (uint8_t)tag[1])
+            return field;
+        p += 3 + payload_len;
+    }
+    return NULL;
+}
+
+static void aux_blob_append_field(uint8_t **aux,
+                                  size_t *aux_len,
+                                  size_t *aux_cap,
+                                  const uint8_t *field) {
+    int payload_len = isam_aux_field_payload_len(field);
+    if (payload_len < 0)
+        die("invalid aux tag while bundling read aux");
+    size_t field_len = 3 + (size_t)payload_len;
+    if (*aux_len + field_len > *aux_cap) {
+        size_t next = *aux_cap ? *aux_cap * 2 : 64;
+        while (next < *aux_len + field_len)
+            next *= 2;
+        *aux = xrealloc(*aux, next);
+        *aux_cap = next;
+    }
+    memcpy(*aux + *aux_len, field - 2, field_len);
+    *aux_len += field_len;
+}
+
+static void maybe_train_read_aux_dict(lmdb_backend_t *lmdb,
+                                      read_aux_dict_trainer_t *trainer,
+                                      const uint8_t *aux,
+                                      size_t aux_len) {
+    if (trainer->trained || trainer->sample_count >= 1000 || aux_len == 0)
+        return;
+    if (aux_len > INT_MAX)
+        die("read aux blob is too large for dictionary training");
+    kputsn((const char *)aux, (int)aux_len, &trainer->samples);
+    trainer->sample_sizes[trainer->sample_count++] = aux_len;
+    if (trainer->sample_count == 1000) {
+        trainer->trained = lmdb_read_aux_set_zstd_dict(lmdb,
+                                                       trainer->samples.s,
+                                                       trainer->sample_sizes,
+                                                       trainer->sample_count,
+                                                       64 * 1024);
+        if (trainer->trained)
+            fprintf(stderr,
+                    "isamtools import: trained read_aux zstd dictionary from 1000 records (%zu bytes)\n",
+                    lmdb->read_aux_zstd_dict_len);
+    }
 }
 
 static char *lock_path_for(const char *path) {
@@ -317,6 +386,8 @@ int cmd_import(int argc, char **argv) {
     if (sml) { view_meta_set(v, "store_max_read_len", sml); free(sml); }
     if (name_alias) view_meta_set(v, "name", name_alias);
     char *store_shared_tags = lmdb_backend_meta_get(store->lmdb, "shared_tags");
+    char *store_shared_tags_for_message =
+        xstrdup(store_shared_tags ? store_shared_tags : "");
     if (store_shared_tags) {
         view_meta_set(v, "shared_tags_snapshot", store_shared_tags);
     }
@@ -336,7 +407,7 @@ int cmd_import(int argc, char **argv) {
             allow_missing ? ", skipping missing reads" : ", requiring all reads in the store",
             write_index ? ", then building all secondary indexes" : "");
         fprintf(stderr,
-            "isamtools import: aux tag handling: shared/import-carried tags go to view read_tag, alignment tags stay inline, canonical shared tags are reconstructed when missing\n");
+            "isamtools import: aux tags: canonical-backed tags are restored from the store BAM/CRAM when missing; import differences and carried tags are stored once per read; alignment-local tags remain on each alignment record\n");
 
     view_set_header(v, in_hdr);
 
@@ -388,19 +459,25 @@ int cmd_import(int argc, char **argv) {
     fprintf(stderr, "isamtools import: tag policy before scanning\n");
     fprintf(stderr, "  store file: %s\n", store_path);
     fprintf(stderr, "  import file: %s\n", input_path);
-    fprintf(stderr, "  import read-level tags stored once per read when present: store-backed read tags plus %s\n",
+    fprintf(stderr, "  canonical-backed tags: %s\n",
+            store_shared_tags_for_message[0] ? store_shared_tags_for_message : "none");
+    fprintf(stderr, "    if absent from the import record, they are restored from the canonical BAM/CRAM during view\n");
+    fprintf(stderr, "    if the import record has a different value, that override is stored once per read in read_aux_by_id\n");
+    fprintf(stderr, "  extra import read-level tags stored once per read: %s\n",
             carried_csv[0] ? carried_csv : "none");
-    fprintf(stderr, "  import alignment tags kept inline: built-in alignment tags%s%s\n",
+    fprintf(stderr, "  tags kept per alignment record: built-in alignment tags%s%s\n",
             keep_alignment_user_csv[0] ? ", plus " : "",
             keep_alignment_user_csv[0] ? keep_alignment_user_csv : "");
-    fprintf(stderr, "  dropped from both import and store reconstruction: %s\n",
+    fprintf(stderr, "  tags removed from final output (--drop-tags): %s\n",
             dropped_csv[0] ? dropped_csv : "none");
-    fprintf(stderr, "  ignored only from import file: %s\n",
+    fprintf(stderr, "  import tag copies ignored; canonical fallback still allowed (--drop-source-tags): %s\n",
             source_dropped_csv[0] ? source_dropped_csv : "none");
-    fprintf(stderr, "  final observed tag summary will be printed after the scan\n");
+    fprintf(stderr, "  observed tags and storage counts will be printed after the scan\n");
 
     lmdb_backend_begin(v->lmdb);
     bam1_t *b = bam_init1();
+    bam1_t *canon_b = bam_init1();
+    payload_cache_t *canonical_cache = payload_cache_create(64 * 1024 * 1024);
     int64_t n_in = 0, n_kept = 0, n_missing = 0;
     int64_t max_ref_span = 0;
     int64_t max_query_len = 0;
@@ -413,6 +490,10 @@ int cmd_import(int argc, char **argv) {
     khash_t(u64set) *conflict_reads = kh_init(u64set);
     if (!conflict_reads)
         die("out of memory");
+    khash_t(u64set) *seen_read_tags = kh_init(u64set);
+    if (!seen_read_tags)
+        die("out of memory");
+    read_aux_dict_trainer_t read_aux_trainer = {0};
     tag_count_t *conflict_counts = NULL;
     size_t n_conflict_counts = 0, cap_conflict_counts = 0;
     isam_tag_set_t observed_alignment_tags;
@@ -458,6 +539,13 @@ int cmd_import(int argc, char **argv) {
         const uint32_t *cigar = bam_get_cigar(b);
         bam1_t *filtered = bam_dup1(b);
         if (!filtered) die("out of memory");
+        int canonical_loaded = 0;
+        uint8_t *read_aux = NULL;
+        size_t read_aux_len = 0;
+        size_t read_aux_cap = 0;
+        int read_aux_changed = 0;
+        if (lmdb_read_aux_get(v->lmdb, srec.read_id, &read_aux, &read_aux_len))
+            read_aux_cap = read_aux_len;
 
         errno = 0;
         for (uint8_t *field = bam_aux_first(b); field; field = bam_aux_next(b, field)) {
@@ -485,22 +573,55 @@ int cmd_import(int argc, char **argv) {
                 if (payload_len < 0)
                     die("invalid aux tag '%s' in '%s'", tag, input_path);
                 char type[2] = { bam_aux_type(field), 0 };
-                int present = 0;
-                int same = read_tag_value_matches(v->lmdb, srec.read_id, tag,
-                                                  type[0], field + 1,
-                                                  (size_t)payload_len, &present);
-                if (!present) {
-                    lmdb_read_tag_put(v->lmdb, srec.read_id, tag, type,
-                                      field + 1, (size_t)payload_len, input_path);
-                    ++n_source_tag_fields_stored;
-                } else if (!same &&
-                           tag_conflict_seen_add(conflict_reads, srec.read_id, tag)) {
-                    tag_count_inc(&conflict_counts, &n_conflict_counts,
-                                  &cap_conflict_counts, tag);
+                int store_has_same = 0;
+                if (scope == ISAM_TAG_SCOPE_SHARED) {
+                    if (!canonical_loaded) {
+                        int frc = payload_cache_fetch(canonical_cache, store,
+                                                      &srec, canon_b);
+                        if (frc != 0)
+                            die("payload fetch failed for '%s' (rc=%d)",
+                                srec.qname, frc);
+                        canonical_loaded = 1;
+                    }
+                    store_has_same = aux_field_value_matches(bam_aux_get(canon_b, tag),
+                                                             type[0],
+                                                             field + 1,
+                                                             (size_t)payload_len);
                 }
-                if (scope == ISAM_TAG_SCOPE_SHARED)
+                int stored_import_value = 0;
+                const uint8_t *existing = aux_blob_find_field(read_aux, read_aux_len, tag);
+                int seen_store_value =
+                    scope == ISAM_TAG_SCOPE_SHARED && !existing &&
+                    read_tag_seen_contains(seen_read_tags, srec.read_id, tag);
+                if (existing) {
+                    int same = aux_field_value_matches(existing, type[0],
+                                                       field + 1,
+                                                       (size_t)payload_len);
+                    if (!same &&
+                        read_tag_seen_add(conflict_reads, srec.read_id, tag)) {
+                        tag_count_inc(&conflict_counts, &n_conflict_counts,
+                                      &cap_conflict_counts, tag);
+                    }
+                } else if (seen_store_value) {
+                    if (!store_has_same &&
+                        read_tag_seen_add(conflict_reads, srec.read_id, tag)) {
+                        tag_count_inc(&conflict_counts, &n_conflict_counts,
+                                      &cap_conflict_counts, tag);
+                    }
+                } else {
+                    if (store_has_same && scope == ISAM_TAG_SCOPE_SHARED) {
+                        read_tag_seen_add(seen_read_tags, srec.read_id, tag);
+                    } else {
+                        aux_blob_append_field(&read_aux, &read_aux_len,
+                                              &read_aux_cap, field);
+                        read_aux_changed = 1;
+                        stored_import_value = 1;
+                        ++n_source_tag_fields_stored;
+                    }
+                }
+                if (scope == ISAM_TAG_SCOPE_SHARED && stored_import_value)
                     isam_tag_set_add(&observed_source_overrides, tag);
-                else
+                else if (scope == ISAM_TAG_SCOPE_CARRIED)
                     isam_tag_set_add(&observed_carried_tags, tag);
                 uint8_t *drop = bam_aux_get(filtered, tag);
                 if (drop && bam_aux_del(filtered, drop) != 0)
@@ -549,6 +670,12 @@ int cmd_import(int argc, char **argv) {
             .is_unmapped = is_unmapped
         };
         lmdb_view_put_import_record(v->lmdb, &rec);
+        if (read_aux_changed) {
+            lmdb_read_aux_put(v->lmdb, srec.read_id, read_aux, read_aux_len);
+            maybe_train_read_aux_dict(v->lmdb, &read_aux_trainer,
+                                      read_aux, read_aux_len);
+        }
+        free(read_aux);
         bam_destroy1(filtered);
         store_record_clear(&srec);
 
@@ -563,6 +690,8 @@ int cmd_import(int argc, char **argv) {
     }
     lmdb_backend_commit(v->lmdb);
     bam_destroy1(b);
+    bam_destroy1(canon_b);
+    payload_cache_destroy(canonical_cache);
     sam_hdr_destroy(in_hdr);
     sam_close(in);
 
@@ -599,19 +728,21 @@ int cmd_import(int argc, char **argv) {
     }
     view_meta_set(v, "import_state", "complete");
     fprintf(stderr, verbose_tag_policy
-            ? "isamtools import: observed tag policy summary\n"
-            : "isamtools import: observed tag policy\n");
-    fprintf(stderr, "  store-backed tags overridden by import file: %s\n",
+            ? "isamtools import: observed aux tag summary\n"
+            : "isamtools import: observed aux tags\n");
+    fprintf(stderr, "  canonical-backed tags with import overrides stored once per read: %s\n",
             source_override_csv[0] ? source_override_csv : "none");
-    fprintf(stderr, "  import-only tags stored once per read: %s\n",
+    fprintf(stderr, "  extra import tags stored once per read: %s\n",
             observed_carried_csv[0] ? observed_carried_csv : "none");
-    fprintf(stderr, "  import alignment tags kept inline: %s\n",
+    fprintf(stderr, "  tags stored per alignment record: %s\n",
             observed_alignment_csv[0] ? observed_alignment_csv : "none");
-    fprintf(stderr, "  tags actually dropped from both import and store reconstruction: %s\n",
+    fprintf(stderr, "  unknown tags stored per alignment record: %s\n",
+            observed_unknown_csv[0] ? observed_unknown_csv : "none");
+    fprintf(stderr, "  tags removed from final output: %s\n",
             observed_drop_csv[0] ? observed_drop_csv : "none");
-    fprintf(stderr, "  tags actually ignored only from import file: %s\n",
+    fprintf(stderr, "  import tag copies ignored while allowing canonical fallback: %s\n",
             observed_source_drop_csv[0] ? observed_source_drop_csv : "none");
-    fprintf(stderr, "  precedence: dropped > import file > store file\n");
+    fprintf(stderr, "  final-output rule: --drop-tags wins; import values win over canonical fallback; canonical fallback fills missing tags\n");
     free(observed_alignment_csv);
     free(observed_unknown_csv);
     free(source_override_csv);
@@ -633,6 +764,8 @@ int cmd_import(int argc, char **argv) {
     isam_tag_set_destroy(&observed_source_drop_tags);
     isam_tag_classifier_destroy(&classifier);
     kh_destroy(u64set, conflict_reads);
+    kh_destroy(u64set, seen_read_tags);
+    free(read_aux_trainer.samples.s);
     free(conflict_counts);
     free(shared_csv);
     free(carried_csv);
@@ -641,6 +774,7 @@ int cmd_import(int argc, char **argv) {
     free(source_dropped_csv);
     free(carry_user_csv);
     free(keep_alignment_user_csv);
+    free(store_shared_tags_for_message);
 
     fprintf(stderr,
             "isamtools import: completed %s\n",
@@ -652,13 +786,21 @@ int cmd_import(int argc, char **argv) {
             (long long)n_missing,
             (long long)max_query_len,
             (long long)max_ref_span);
+    fprintf(stderr, "isamtools import: aux tag storage summary\n");
     fprintf(stderr,
-            "isamtools import: stored %lld import tag fields once per read, kept %lld alignment tag fields inline, dropped %lld fields completely, import-only-dropped %lld fields, and kept %lld unknown fields inline\n",
-            (long long)n_source_tag_fields_stored,
-            (long long)n_alignment_tag_fields_kept_inline,
-            (long long)n_dropped_tag_fields,
-            (long long)n_source_dropped_tag_fields,
+            "  read_aux_by_id fields written once per read: %lld (canonical overrides plus extra import read tags)\n",
+            (long long)n_source_tag_fields_stored);
+    fprintf(stderr,
+            "  aln_by_id inline aux fields written per alignment: %lld (alignment-local tags; includes %lld unknown fields)\n",
+            (long long)(n_alignment_tag_fields_kept_inline +
+                        n_unknown_tag_fields_kept_inline),
             (long long)n_unknown_tag_fields_kept_inline);
+    fprintf(stderr,
+            "  import aux fields removed by --drop-tags: %lld\n",
+            (long long)n_dropped_tag_fields);
+    fprintf(stderr,
+            "  import aux fields ignored by --drop-source-tags: %lld\n",
+            (long long)n_source_dropped_tag_fields);
 
     if (verify_after_import)
         isam_check_view_against_bam(input_path, final_aln_path, NULL, NULL);

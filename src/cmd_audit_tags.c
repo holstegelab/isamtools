@@ -20,7 +20,7 @@ static void usage(void) {
         "header hints, and explicit tag-policy overrides.\n"
         "\n"
         "Options:\n"
-        "  --share-tags TAGS          Comma-separated tags shared from the store.\n"
+        "  --share-tags TAGS          Tags reconstructed from canonical BAM/CRAM.\n"
         "  --no-share-tags TAGS       Comma-separated tags excluded from sharing.\n"
         "  --carry-tags TAGS          Comma-separated tags stored once per read.\n"
         "  --keep-alignment-tags TAGS Comma-separated tags kept per alignment.\n"

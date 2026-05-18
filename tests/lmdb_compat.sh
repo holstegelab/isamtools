@@ -164,7 +164,7 @@ C
 
 cc -no-pie -I"$ROOT/include" -I"$HTSLIB_INC" \
     "$WORK/c_api_lmdb.c" "$BUILD_ROOT/libisam.a" \
-    "$LMDB_LIB" "$HTSLIB_LIB" "${BZIP2_LINK[@]}" -lz -llzma -lm -lpthread -o "$WORK/c_api_lmdb"
+    "$LMDB_LIB" "$HTSLIB_LIB" "${BZIP2_LINK[@]}" -lz -llzma -lm -lpthread -lzstd -o "$WORK/c_api_lmdb"
 "$WORK/c_api_lmdb" "$WORK/view.isam"
 
 echo "lmdb compat OK"

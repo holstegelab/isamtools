@@ -37,7 +37,7 @@ BZIP2_LIB := $(BZIP2_PREFIX)/lib/libbz2.a
 HTSLIB_CONFIGURE_FLAGS ?= --disable-libcurl --disable-plugins --disable-s3 --disable-gcs --without-libdeflate
 HTSLIB_CONFIGURE_CPPFLAGS ?= -I$(BZIP2_PREFIX)/include
 HTSLIB_CONFIGURE_LDFLAGS ?= -L$(BZIP2_PREFIX)/lib
-SYS_LIBS ?= -lz -llzma -lm -lpthread
+SYS_LIBS ?= -lz -llzma -lm -lpthread -lzstd
 EXE_LDFLAGS ?= -no-pie
 
 WARNFLAGS := -Wall -Wextra -Wno-unused-parameter -Wshadow
@@ -60,6 +60,7 @@ ISAM_SOURCES := \
 	src/cmd_sort.c \
 	src/cmd_view.c \
 	src/cmd_annotate.c \
+	src/cmd_store_stats.c \
 	src/cmd_audit_tags.c \
 	src/cmd_update.c \
 	src/cmd_rehint.c \
