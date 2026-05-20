@@ -1,0 +1,3 @@
+1. You are running on a different machine then the data is located. Keep compilations/environments separate for this machine and the original machine.  Also, when running here, make sure you only work with small files (subsets of the very large files in /data). 
+
+2. When implementing this, make sure you generate clean code. Not all kinds of fallbacks, legacy things, error pampering.  If there is an error, report it. 

@@ -39,6 +39,12 @@ typedef struct query_hits {
     size_t cap_alns;
 } query_hits_t;
 
+typedef struct query_interval {
+    int tid;
+    int64_t beg;
+    int64_t end;
+} query_interval_t;
+
 typedef struct query_source {
     char *alias;
     char *path;
@@ -83,6 +89,10 @@ typedef struct selector_set {
     char *label;
 } selector_set_t;
 
+typedef struct span_spec {
+    char *arg;
+} span_spec_t;
+
 static void usage(void) {
     fputs(
         "Usage: isamtools query [options]\n"
@@ -100,6 +110,9 @@ static void usage(void) {
         "  --subset A:NAME       Select reads in subset NAME from source A.\n"
         "  --qnames FILE         Select one QNAME per line from FILE.\n"
         "  --join union|inner    Combine multiple selectors [union].\n"
+        "  --span A:DIST         Expand the selected reads through source A:\n"
+        "                        merge selected-read alignments separated by\n"
+        "                        <= DIST bases, then add all reads in those spans.\n"
         "\n"
         "Output:\n"
         "  --columns LIST        Comma-separated columns. Examples:\n"
@@ -391,6 +404,40 @@ static void hits_destroy(query_hits_t *hits) {
     memset(hits, 0, sizeof *hits);
 }
 
+static void interval_add(query_interval_t **items,
+                         size_t *n_items,
+                         size_t *cap_items,
+                         int tid,
+                         int64_t beg,
+                         int64_t end) {
+    if (tid < 0 || end <= beg)
+        return;
+    if (*n_items == *cap_items) {
+        *cap_items = *cap_items ? *cap_items * 2 : 1024;
+        *items = xrealloc(*items, *cap_items * sizeof **items);
+    }
+    (*items)[*n_items].tid = tid;
+    (*items)[*n_items].beg = beg;
+    (*items)[*n_items].end = end;
+    ++*n_items;
+}
+
+static int interval_cmp(const void *a, const void *b) {
+    const query_interval_t *x = a;
+    const query_interval_t *y = b;
+    if (x->tid != y->tid)
+        return x->tid < y->tid ? -1 : 1;
+    if (x->beg != y->beg)
+        return x->beg < y->beg ? -1 : 1;
+    if (x->end != y->end)
+        return x->end < y->end ? -1 : 1;
+    return 0;
+}
+
+static void select_region(query_source_t *src,
+                          const char *region,
+                          qname_set_t *out);
+
 static void collect_source_hits(query_source_t *src,
                                 const char *qname,
                                 query_hits_t *hits) {
@@ -438,6 +485,72 @@ static void collect_source_hits(query_source_t *src,
         lmdb_view_record_clear(&rec);
     }
     lmdb_view_iter_close(it);
+}
+
+static void select_interval(query_source_t *src,
+                            int tid,
+                            int64_t beg,
+                            int64_t end,
+                            qname_set_t *out) {
+    const char *rname = sam_hdr_tid2name(src->hdr, tid);
+    if (!rname)
+        die("source '%s' has no reference name for tid %d", src->alias, tid);
+    char region[1024];
+    int n = snprintf(region, sizeof region, "%s:%lld-%lld",
+                     rname, (long long)beg + 1, (long long)end);
+    if (n < 0 || (size_t)n >= sizeof region)
+        die("reference name too long while building query span for '%s'",
+            src->alias);
+    select_region(src, region, out);
+}
+
+static void apply_span(query_source_t *src,
+                       qname_set_t *selected,
+                       int64_t max_gap) {
+    if (max_gap < 0)
+        die("--span distance must be non-negative");
+    qname_set_sort_unique(selected);
+
+    query_interval_t *intervals = NULL;
+    size_t n_intervals = 0, cap_intervals = 0;
+    for (size_t i = 0; i < selected->n; ++i) {
+        query_hits_t hits;
+        collect_source_hits(src, selected->items[i], &hits);
+        for (size_t j = 0; j < hits.n_alns; ++j) {
+            query_aln_t *aln = &hits.alns[j];
+            if (aln->is_unmapped)
+                continue;
+            interval_add(&intervals, &n_intervals, &cap_intervals,
+                         aln->tid, aln->pos0, aln->end0);
+        }
+        hits_destroy(&hits);
+    }
+
+    if (n_intervals == 0) {
+        free(intervals);
+        return;
+    }
+    qsort(intervals, n_intervals, sizeof *intervals, interval_cmp);
+
+    qname_set_t expanded = { 0 };
+    query_interval_t cur = intervals[0];
+    for (size_t i = 1; i < n_intervals; ++i) {
+        query_interval_t next = intervals[i];
+        if (next.tid == cur.tid &&
+            (next.beg <= cur.end || next.beg - cur.end <= max_gap)) {
+            if (next.end > cur.end)
+                cur.end = next.end;
+            continue;
+        }
+        select_interval(src, cur.tid, cur.beg, cur.end, &expanded);
+        cur = next;
+    }
+    select_interval(src, cur.tid, cur.beg, cur.end, &expanded);
+
+    qname_set_union_into(selected, &expanded);
+    qname_set_sort_unique(selected);
+    qname_set_destroy(&expanded);
+    free(intervals);
 }
 
 static int overlaps(int tid, int64_t beg, int64_t end,
@@ -782,11 +895,17 @@ static void selector_set_destroy(selector_set_t *sel) {
     free(sel->label);
 }
 
+static void span_spec_destroy(span_spec_t *span) {
+    free(span->arg);
+}
+
 int cmd_query(int argc, char **argv) {
     query_source_t *sources = NULL;
     size_t n_sources = 0, cap_sources = 0;
     selector_set_t *selectors = NULL;
     size_t n_selectors = 0, cap_selectors = 0;
+    span_spec_t *spans = NULL;
+    size_t n_spans = 0, cap_spans = 0;
     query_column_t *columns = NULL;
     size_t n_columns = 0, cap_columns = 0;
     const char *columns_arg = NULL;
@@ -803,6 +922,7 @@ int cmd_query(int argc, char **argv) {
         {"columns",   required_argument, 0, 1004},
         {"join",      required_argument, 0, 1005},
         {"no-header", no_argument,       0, 1006},
+        {"span",      required_argument, 0, 1007},
         {"output",    required_argument, 0, 'o'},
         {"help",      no_argument,       0, 'h'},
         {0,0,0,0}
@@ -863,6 +983,13 @@ int cmd_query(int argc, char **argv) {
         case 1006:
             print_header = 0;
             break;
+        case 1007:
+            if (n_spans == cap_spans) {
+                cap_spans = cap_spans ? cap_spans * 2 : 4;
+                spans = xrealloc(spans, cap_spans * sizeof *spans);
+            }
+            spans[n_spans++].arg = xstrdup(optarg);
+            break;
         case 'o':
             output_path = optarg;
             break;
@@ -914,6 +1041,21 @@ int cmd_query(int argc, char **argv) {
     }
     qname_set_sort_unique(&selected);
 
+    for (size_t i = 0; i < n_spans; ++i) {
+        char *alias = NULL, *value = NULL;
+        split_alias_value(spans[i].arg, "--span", &alias, &value);
+        char *endp = NULL;
+        errno = 0;
+        long long max_gap = strtoll(value, &endp, 10);
+        if (errno || endp == value || *endp || max_gap < 0)
+            die("--span distance must be a non-negative integer, got '%s'",
+                value);
+        int src_i = find_source(sources, n_sources, alias);
+        apply_span(&sources[src_i], &selected, (int64_t)max_gap);
+        free(alias);
+        free(value);
+    }
+
     FILE *out = stdout;
     if (strcmp(output_path, "-") != 0) {
         out = fopen(output_path, "w");
@@ -963,6 +1105,9 @@ int cmd_query(int argc, char **argv) {
     for (size_t i = 0; i < n_selectors; ++i)
         selector_set_destroy(&selectors[i]);
     free(selectors);
+    for (size_t i = 0; i < n_spans; ++i)
+        span_spec_destroy(&spans[i]);
+    free(spans);
     for (size_t i = 0; i < n_columns; ++i)
         column_destroy(&columns[i]);
     free(columns);

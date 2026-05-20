@@ -30,9 +30,14 @@ isamtools query \
 - `--qnames FILE`: select one QNAME per line.
 - `--join union|inner`: combine selectors by union or intersection. The default
   is `union`.
+- `--span ALIAS:DIST`: after the selectors and `--join` have built the seed
+  read set, look up those reads in source `ALIAS`, merge their mapped alignment
+  intervals per reference when the gap is at most `DIST` bases, and add all
+  reads overlapping the merged spans.
 
 Region selection on alignment views requires `isamtools sort --interval` or
 `--all`. Region selection on store sources uses the canonical BAM/CRAM index.
+Span expansion uses the same indexes as region selection on the spanned source.
 
 ## Columns
 
@@ -59,6 +64,10 @@ Coordinates in `pos` are 1-based SAM-style starts. `start0` and `end0` are
 0-based half-open coordinates. `region` is printed as `rname:pos-end`, with
 1-based inclusive-looking endpoints matching the aligned span.
 
+When a source has multiple alignments for a QNAME, source fields are
+semicolon-separated in the same alignment order for that source. Use the `n`
+field to see how many alignments contributed to those list-valued fields.
+
 ## Examples
 
 ```bash
@@ -67,6 +76,13 @@ isamtools query \
   --source chm13:reads.chm13.isam \
   --select hg38:chrX:1000000-1100000 \
   --columns qname,hg38.region,hg38.mapq,chm13.region,chm13.mapq
+
+isamtools query \
+  --source hg38:reads.hg38.ssam \
+  --source chm13:reads.chm13.isam \
+  --select hg38:chrX:1000000-1100000 \
+  --span chm13:10000 \
+  --columns qname,hg38.region,chm13.region,chm13.n
 
 isamtools query \
   --source hg38:reads.hg38.ssam \

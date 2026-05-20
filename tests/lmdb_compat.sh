@@ -105,6 +105,19 @@ grep -q $'^qShort\tchrS:1-8\tchrV:100-107$' "$WORK/query_subset.tsv"
 grep -q $'^qPair\tchrS:900-907\tchrV:300-307;chrV:900-907$' "$WORK/query_store_region.tsv"
 
 "$TOOL" query \
+    --source hg38:"$WORK/store.ssam" \
+    --source chm13:"$WORK/view.isam" \
+    --select hg38:chrS:895-905 \
+    --span chm13:600 \
+    --columns qname,chm13.region \
+    --no-header \
+    > "$WORK/query_span.tsv"
+[[ $(awk 'END { print NR }' "$WORK/query_span.tsv") == 3 ]]
+grep -q $'^qLong\tchrV:1-500$' "$WORK/query_span.tsv"
+grep -q $'^qOther\tchrV:800-807$' "$WORK/query_span.tsv"
+grep -q $'^qPair\tchrV:300-307;chrV:900-907$' "$WORK/query_span.tsv"
+
+"$TOOL" query \
     --source "$WORK/view.isam" \
     --select isam:chrV:895-905 \
     --columns qname,isam.region \
