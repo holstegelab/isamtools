@@ -192,6 +192,8 @@ For private, machine-local validation and profiling against the large files in
 ```bash
 N=10000 tests/private_data_validate.sh
 N=100000 tests/profile_private_data.sh
+SYNTHETIC=0 CANON_BAM=data/sample.chm13.bam ALN_BAM=data/sample.hg38.bam \
+  REPEATS=5 KEEP_WORK=1 tests/profile_comprehensive.sh
 ```
 
 ## C API
