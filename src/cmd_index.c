@@ -3,6 +3,8 @@
 #include "aux_tags.h"
 
 #include <htslib/hts.h>
+#include <htslib/sam.h>
+#include <htslib/cram.h>
 #include <htslib/bgzf.h>
 #include <htslib/khash.h>
 #include <htslib/kstring.h>
@@ -27,8 +29,48 @@ static void usage(void) {
         "  --verbose-tag-policy  Print a detailed tag policy summary.\n"
         "  --yes                 Accept tag policy warnings.\n"
     "  -o, --output P   Override default output path (<store-root>.ssam).\n"
+        "  -T, --reference P  Reference FASTA (required for a CRAM canonical store).\n"
         "  -h, --help       Show this help.\n",
         stderr);
+}
+
+/* Scan a CRAM canonical store's container index and return, in container order,
+ * each container's byte offset and record count. Requires a .crai. The view
+ * side uses this table to fetch a read's payload by (container offset, index). */
+static int64_t build_cram_container_table(const char *store_path,
+                                          int64_t **coff_out, int32_t **nrec_out) {
+    samFile *cf = sam_open(store_path, "r");
+    if (!cf) die("cannot open '%s' for CRAM container scan", store_path);
+    sam_hdr_t *ch = sam_hdr_read(cf);
+    if (!ch) die("cannot read header of '%s'", store_path);
+    hts_idx_t *idx = sam_index_load(cf, store_path);
+    if (!idx)
+        die("CRAM canonical store '%s' has no .crai index; run `samtools index` on it first",
+            store_path);
+    cram_fd *fd = cf->fp.cram;
+    int64_t nc = cram_num_containers(fd);
+    if (nc <= 0)
+        die("cram_num_containers returned %lld for '%s'", (long long)nc, store_path);
+    int64_t *coff = xmalloc((size_t)nc * sizeof *coff);
+    int32_t *nrec = xmalloc((size_t)nc * sizeof *nrec);
+    for (int64_t k = 0; k < nc; ++k) {
+        off_t off = cram_container_num2offset(fd, k);
+        if (off < 0)
+            die("cram_container_num2offset(%lld) failed for '%s'", (long long)k, store_path);
+        if (cram_seek(fd, off, SEEK_SET) < 0)
+            die("cram_seek during container scan of '%s'", store_path);
+        cram_container *c = cram_read_container(fd);
+        if (!c)
+            die("cram_read_container %lld failed for '%s'", (long long)k, store_path);
+        coff[k] = (int64_t)off;
+        nrec[k] = cram_container_get_num_records(c);
+    }
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(ch);
+    sam_close(cf);
+    *coff_out = coff;
+    *nrec_out = nrec;
+    return nc;
 }
 
 static void lmdb_set_header_meta(lmdb_backend_t *lmdb, sam_hdr_t *hdr) {
@@ -334,6 +376,28 @@ static int index_lmdb(const char *store_path, const char *out_path,
     bam1_t *b = bam_init1();
     int64_t max_read_len = 0;
     int have_voffset = is_bam;
+
+    /* CRAM canonical: build the container table and cumulative record bases so
+     * each read can be tagged with a (container offset, within-container index)
+     * payload locator, the CRAM analogue of the BAM BGZF virtual offset. */
+    int64_t *cram_coff = NULL;
+    int32_t *cram_nrec = NULL;
+    int64_t *cram_base = NULL;
+    int64_t  cram_nc = 0;
+    int64_t  cram_ci = 0;
+    if (!is_bam) {
+        cram_nc = build_cram_container_table(store_path, &cram_coff, &cram_nrec);
+        cram_base = xmalloc((size_t)(cram_nc + 1) * sizeof *cram_base);
+        int64_t cum = 0;
+        for (int64_t k = 0; k < cram_nc; ++k) { cram_base[k] = cum; cum += cram_nrec[k]; }
+        cram_base[cram_nc] = cum;
+        lmdb_store_put_cram_container_table(lmdb, cram_coff, cram_nrec, cram_nc);
+        fprintf(stderr,
+                "isamtools index: CRAM canonical: %lld containers, %lld records "
+                "(payload located by container offset + within-container index)\n",
+                (long long)cram_nc, (long long)cum);
+    }
+
     isam_tag_set_t observed_shared_tags;
     isam_tag_set_t observed_alignment_tags;
     isam_tag_set_t unknown_canonical_tags;
@@ -357,6 +421,25 @@ static int index_lmdb(const char *store_path, const char *out_path,
 
         const char *qname = bam_get_qname(b);
         ++stats.n_alignment_records;
+
+        /* Locate this raw record within the CRAM container table. The raw index
+         * counts every record (incl. secondary/supplementary) so it stays in
+         * lockstep with the container record counts and a sequential rescan. */
+        int64_t cram_loc_coffset = -1;
+        int32_t cram_loc_within = 0;
+        int     cram_has_loc = 0;
+        if (!is_bam) {
+            int64_t raw_i = stats.n_alignment_records - 1;
+            while (cram_ci + 1 < cram_nc && raw_i >= cram_base[cram_ci + 1]) cram_ci++;
+            if (raw_i < cram_base[cram_ci] || raw_i >= cram_base[cram_ci + 1])
+                die("cram record %lld outside container table [%lld,%lld)",
+                    (long long)raw_i, (long long)cram_base[cram_ci],
+                    (long long)cram_base[cram_ci + 1]);
+            cram_loc_coffset = cram_coff[cram_ci];
+            cram_loc_within = (int32_t)(raw_i - cram_base[cram_ci]);
+            cram_has_loc = 1;
+        }
+
         errno = 0;
         for (uint8_t *field = bam_aux_first(b); field; field = bam_aux_next(b, field)) {
             char tag[3] = { bam_aux_tag(field)[0], bam_aux_tag(field)[1], 0 };
@@ -419,7 +502,10 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 .flag = b->core.flag,
                 .is_unmapped = is_unmapped,
                 .bam_voffset = (have_voffset && voffset >= 0) ? voffset : -1,
-                .has_voffset = (have_voffset && voffset >= 0) ? 1 : 0
+                .has_voffset = (have_voffset && voffset >= 0) ? 1 : 0,
+                .cram_coffset = cram_loc_coffset,
+                .cram_within = cram_loc_within,
+                .has_cram_loc = cram_has_loc
             };
             lmdb_store_put_record(lmdb, &rec);
             canonical_map_put(canonical_reads, qname, read_id, 1, is_unmapped);
@@ -460,7 +546,10 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 .flag = b->core.flag,
                 .is_unmapped = is_unmapped,
                 .bam_voffset = (have_voffset && voffset >= 0) ? voffset : -1,
-                .has_voffset = (have_voffset && voffset >= 0) ? 1 : 0
+                .has_voffset = (have_voffset && voffset >= 0) ? 1 : 0,
+                .cram_coffset = cram_loc_coffset,
+                .cram_within = cram_loc_within,
+                .has_cram_loc = cram_has_loc
             };
             if (state && state->is_supplementary) {
                 lmdb_store_update_record(lmdb, &rec);
@@ -484,6 +573,9 @@ static int index_lmdb(const char *store_path, const char *out_path,
     bam_destroy1(b);
     sam_hdr_destroy(hdr);
     sam_close(input);
+    free(cram_coff);
+    free(cram_nrec);
+    free(cram_base);
 
     lmdb_store_put_meta_i64(lmdb, "indexed_name", 1);
     lmdb_store_put_meta_i64(lmdb, "indexed_coord", 1);
@@ -583,6 +675,7 @@ int cmd_index(int argc, char **argv) {
     const char *out_path   = NULL;
     const char *share_tags = NULL;
     const char *no_share_tags = NULL;
+    const char *reference = NULL;
     int yes = 0;
     int strict_tag_policy = 0;
     int verbose_tag_policy = 0;
@@ -595,11 +688,12 @@ int cmd_index(int argc, char **argv) {
         {"strict-tag-policy", no_argument, 0, 1005},
         {"verbose-tag-policy", no_argument, 0, 1006},
         {"output", required_argument, 0, 'o'},
+        {"reference", required_argument, 0, 'T'},
         {"help",   no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "o:h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "o:T:h", longopts, NULL)) != -1) {
         switch (c) {
         case 1000: name_alias = optarg; break;
         case 1002: share_tags = optarg; break;
@@ -608,6 +702,7 @@ int cmd_index(int argc, char **argv) {
         case 1005: strict_tag_policy = 1; break;
         case 1006: verbose_tag_policy = 1; break;
         case 'o':  out_path   = optarg; break;
+        case 'T':  reference  = optarg; break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
@@ -628,6 +723,13 @@ int cmd_index(int argc, char **argv) {
     int is_cram = (fmt && fmt->format == cram);
     if (!is_bam && !is_cram)
         die("unsupported canonical store format (need BAM or CRAM)");
+
+    if (is_cram) {
+        if (!reference)
+            die("indexing a CRAM canonical store requires -T/--reference");
+        if (hts_set_fai_filename(input, reference) != 0)
+            die("cannot set reference FASTA '%s' for '%s'", reference, store_path);
+    }
 
     sam_hdr_t *hdr = sam_hdr_read(input);
     if (!hdr) die("cannot read header of '%s'", store_path);

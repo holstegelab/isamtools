@@ -37,6 +37,11 @@ static void usage(void) {
         "  --verbose-tag-policy Print a detailed tag policy summary.\n"
         "  --allow-missing      Skip records whose QNAME isn't in the store.\n"
         "  --write-index        Run `sort --all` after import.\n"
+        "  --fast-verify        Verify shared read-level tags against the canonical on a\n"
+        "                       declining sample of PRIMARY reads instead of every read\n"
+        "                       (secondary/supplementary always verified). Faster; any\n"
+        "                       mismatch is reported. Reconstruction is identical when\n"
+        "                       shared tags are read-level (as for PacBio MM/ML/RG).\n"
         "  -h, --help           Show this help.\n",
         stderr);
 }
@@ -106,6 +111,44 @@ static int aux_field_value_matches(const uint8_t *field,
     return bam_aux_type(field) == type &&
            (size_t)payload_len == value_len &&
            (value_len == 0 || memcmp(field + 1, value, value_len) == 0);
+}
+
+/* Per shared-tag dedup viability, learned from PRIMARY reads.
+ *
+ * A canonical store and an imported alignment can be the SAME reads produced by
+ * DIFFERENT processing runs. Then the big read-level payload (SEQ/QUAL and the
+ * MM/ML methylation tags) is byte-identical and dedups, but small CCS scalar
+ * tags differ: integer tags get re-typed (np uint8 vs int32, zm uint32 vs
+ * int32) and float metrics get recomputed to slightly different bits (ec, rq,
+ * sn). Such tags can NEVER be deduped -- they must be stored on every read.
+ * Byte-for-byte reconstruction is preserved because the differing value is kept
+ * in the view's per-read aux blob.
+ *
+ * The problem for --fast-verify is that an ever-differing tag would otherwise
+ * (a) reset the sampling stride every read and (b) force a canonical fetch every
+ * read, collapsing sampling to verify-everything. We therefore learn, per tag,
+ * whether it matches the canonical on primary reads, and treat systematically
+ * differing tags as "always store": no fetch, no trust, no stride reset. */
+typedef struct { char tag[2]; long checked; long mism; } tag_dedup_stat_t;
+#define TAG_DEDUP_CAP 64
+#define TAG_DEDUP_DECIDE 512   /* primary observations before a verdict */
+
+static tag_dedup_stat_t *tag_dedup_get(tag_dedup_stat_t *a, int *n,
+                                       const char *tag) {
+    for (int i = 0; i < *n; ++i)
+        if (a[i].tag[0] == tag[0] && a[i].tag[1] == tag[1]) return &a[i];
+    if (*n >= TAG_DEDUP_CAP) return NULL;
+    a[*n].tag[0] = tag[0]; a[*n].tag[1] = tag[1];
+    a[*n].checked = 0; a[*n].mism = 0;
+    return &a[(*n)++];
+}
+/* Safe to TRUST (dedup on an unsampled read): observed enough on primary reads
+ * and has NEVER mismatched the canonical. A single mismatch (recomputed float,
+ * re-typed int) makes a tag non-dedupable -- it is then stored on every read.
+ * Note ec/rq/sn differ on ~95% of reads but coincidentally match on a few, so
+ * "always mismatches" is the wrong test; "never mismatched" is the right one. */
+static int tag_dedupable(const tag_dedup_stat_t *s) {
+    return s && s->checked >= TAG_DEDUP_DECIDE && s->mism == 0;
 }
 
 static const uint8_t *aux_blob_find_field(const uint8_t *aux,
@@ -289,8 +332,10 @@ int cmd_import(int argc, char **argv) {
     int verify_after_import = 0;
     int allow_missing = 0;
     int write_index   = 0;
+    int fast_verify   = 0;
 
     static struct option longopts[] = {
+        {"fast-verify",   no_argument,       0, 1014},
         {"store",         required_argument, 0, 1000},
         {"store-index",   required_argument, 0, 1001},
         {"aln",           required_argument, 0, 1002},
@@ -323,6 +368,7 @@ int cmd_import(int argc, char **argv) {
         case 1011: strict_tag_policy = 1; break;
         case 1012: verbose_tag_policy = 1; break;
         case 1013: verify_after_import = 1; break;
+        case 1014: fast_verify = 1; break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
@@ -508,6 +554,30 @@ int cmd_import(int argc, char **argv) {
     isam_tag_set_init(&observed_drop_tags);
     isam_tag_set_t observed_source_drop_tags;
     isam_tag_set_init(&observed_source_drop_tags);
+
+    /* Adaptive shared-tag verification (--fast-verify). The per-read canonical
+     * fetch only confirms that read-level shared tags (MM/ML/RG/PacBio per-read)
+     * equal the canonical's, which for valid data they always do. We verify the
+     * first VERIFY_WARMUP shared-tag reads, then only 1 in `verify_stride`, with
+     * the stride doubling after each run of VERIFY_GROW_AFTER consecutive matches
+     * and dropping back to 1 on any mismatch. A skipped read trusts the canonical
+     * (dedups the shared tag). Without --fast-verify every read is verified. */
+    /* Warmup force-verifies primary reads while the stride ramps (doubling after
+     * each VERIFY_GROW_AFTER matches); the ramp reaches VERIFY_STRIDE_MAX right at
+     * the end of warmup. Deep PacBio files have millions of reads, so a short
+     * warmup + fast ramp keeps the fixed fetch cost tiny while still sampling
+     * enough to trust the canonical (tag dedup verdicts need TAG_DEDUP_DECIDE
+     * primary observations, << warmup). */
+    const int64_t VERIFY_WARMUP = 4000;
+    const int64_t VERIFY_STRIDE_MAX = 1024;
+    const int64_t VERIFY_GROW_AFTER = 400;
+    int64_t verify_stride = 1, ok_streak = 0;
+    int64_t n_shared_reads = 0, n_verified = 0, n_trusted = 0, n_tag_mismatch = 0;
+    int64_t n_suppl_stored = 0;   /* non-primary reads: shared tags stored, no fetch */
+    /* learned per-tag dedup viability (see tag_dedup_stat_t above) */
+    tag_dedup_stat_t tag_dedup[TAG_DEDUP_CAP];
+    int n_tag_dedup = 0;
+
     while (1) {
         int64_t voffset = -1;
         if (input_is_bam)
@@ -535,11 +605,16 @@ int cmd_import(int argc, char **argv) {
         }
 
         int is_unmapped = (b->core.flag & BAM_FUNMAP) ? 1 : 0;
+        int is_primary_read = !(b->core.flag &
+                                (BAM_FSECONDARY | BAM_FSUPPLEMENTARY));
         int n_cigar = b->core.n_cigar;
         const uint32_t *cigar = bam_get_cigar(b);
         bam1_t *filtered = bam_dup1(b);
         if (!filtered) die("out of memory");
         int canonical_loaded = 0;
+        int do_verify = 1;       /* verify this read's shared tags vs canonical? */
+        int verify_decided = 0;
+        int read_real_mismatch = 0;  /* an UNEXPECTED mismatch -> reset stride */
         uint8_t *read_aux = NULL;
         size_t read_aux_len = 0;
         size_t read_aux_cap = 0;
@@ -574,19 +649,63 @@ int cmd_import(int argc, char **argv) {
                     die("invalid aux tag '%s' in '%s'", tag, input_path);
                 char type[2] = { bam_aux_type(field), 0 };
                 int store_has_same = 0;
+                tag_dedup_stat_t *ds = NULL;
                 if (scope == ISAM_TAG_SCOPE_SHARED) {
-                    if (!canonical_loaded) {
-                        int frc = payload_cache_fetch(canonical_cache, store,
-                                                      &srec, canon_b);
-                        if (frc != 0)
-                            die("payload fetch failed for '%s' (rc=%d)",
-                                srec.qname, frc);
-                        canonical_loaded = 1;
+                    ds = tag_dedup_get(tag_dedup, &n_tag_dedup, tag);
+                    if (!verify_decided) {
+                        ++n_shared_reads;
+                        if (!is_primary_read) {
+                            /* Secondary/supplementary: hard-clipping shifts MM/ML
+                             * off the canonical primary and scalar CCS tags differ
+                             * by processing, so nothing dedups. Store every shared
+                             * tag verbatim -- never fetch, never touch the stride. */
+                            do_verify = 0;
+                            ++n_suppl_stored;
+                        } else {
+                            /* Primary reads sample-verify on a growing stride. */
+                            do_verify = (!fast_verify) ||
+                                        (n_shared_reads <= VERIFY_WARMUP) ||
+                                        (verify_stride <= 1) ||
+                                        (n_shared_reads % verify_stride == 0);
+                            if (do_verify) ++n_verified; else ++n_trusted;
+                        }
+                        verify_decided = 1;
                     }
-                    store_has_same = aux_field_value_matches(bam_aux_get(canon_b, tag),
-                                                             type[0],
-                                                             field + 1,
-                                                             (size_t)payload_len);
+                    if (!is_primary_read) {
+                        store_has_same = 0;   /* store this tag verbatim */
+                    } else if (do_verify) {
+                        if (!canonical_loaded) {
+                            int frc = payload_cache_fetch(canonical_cache, store,
+                                                          &srec, canon_b);
+                            if (frc != 0)
+                                die("payload fetch failed for '%s' (rc=%d)",
+                                    srec.qname, frc);
+                            canonical_loaded = 1;
+                        }
+                        store_has_same = aux_field_value_matches(bam_aux_get(canon_b, tag),
+                                                                 type[0],
+                                                                 field + 1,
+                                                                 (size_t)payload_len);
+                        /* Learn dedup viability from primary reads only. A tag is
+                         * "reliable" until its first mismatch. */
+                        int was_reliable = ds && ds->mism == 0;
+                        if (is_primary_read && ds) {
+                            ++ds->checked;
+                            if (!store_has_same) ++ds->mism;
+                        }
+                        if (!store_has_same && is_primary_read && was_reliable) {
+                            /* Reset the stride only when a previously-perfect tag
+                             * mismatches (a genuine anomaly). A tag that has ever
+                             * differed is expected to differ -- storing it, not
+                             * resetting -- so ec/rq/sn/np/zm don't defeat sampling. */
+                            read_real_mismatch = 1;
+                        }
+                    } else {
+                        /* Unsampled: trust only tags proven dedupable; a tag that
+                         * systematically differs (or is not yet decided) is stored
+                         * from the read so reconstruction stays byte-exact. */
+                        store_has_same = tag_dedupable(ds) ? 1 : 0;
+                    }
                 }
                 int stored_import_value = 0;
                 const uint8_t *existing = aux_blob_find_field(read_aux, read_aux_len, tag);
@@ -640,6 +759,20 @@ int cmd_import(int argc, char **argv) {
         if (errno && errno != ENOENT)
             die("corrupt aux data in '%s' at record %lld",
                 input_path, (long long)n_in);
+
+        /* Adapt the verification stride: grow after a run of matches, reset on
+         * any mismatch (a shared tag differing from the canonical). */
+        if (fast_verify && verify_decided && do_verify) {
+            if (read_real_mismatch) {
+                ++n_tag_mismatch;
+                verify_stride = 1;
+                ok_streak = 0;
+            } else if (++ok_streak >= VERIFY_GROW_AFTER &&
+                       verify_stride < VERIFY_STRIDE_MAX) {
+                verify_stride *= 2;
+                ok_streak = 0;
+            }
+        }
 
         const uint8_t *aux = bam_get_aux(filtered);
         int aux_len = bam_get_l_aux(filtered);
@@ -786,6 +919,13 @@ int cmd_import(int argc, char **argv) {
             (long long)n_missing,
             (long long)max_query_len,
             (long long)max_ref_span);
+    if (fast_verify)
+        fprintf(stderr,
+                "isamtools import: --fast-verify: primary %lld verified / %lld trusted, "
+                "non-primary %lld stored verbatim (final stride 1/%lld, %lld stride resets); "
+                "shared tags that differ from the canonical are stored per read, not lost\n",
+                (long long)n_verified, (long long)n_trusted, (long long)n_suppl_stored,
+                (long long)verify_stride, (long long)n_tag_mismatch);
     fprintf(stderr, "isamtools import: aux tag storage summary\n");
     fprintf(stderr,
             "  read_aux_by_id fields written once per read: %lld (canonical overrides plus extra import read tags)\n",

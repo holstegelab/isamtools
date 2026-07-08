@@ -171,7 +171,7 @@ $(BZIP2_LIB): $(BZIP2_SRC)/Makefile
 	cp $(BZIP2_SRC)/libbz2.a $(BZIP2_PREFIX)/lib/
 
 $(OBJ_DIR)/src/%.o: src/%.c | $(OBJ_DIR)/src $(HTSLIB_LIB) $(LMDB_LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -fvisibility=hidden -fPIC -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -fvisibility=hidden -fPIC -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/libisam.a: $(ISAM_OBJECTS)
 	mkdir -p $(BUILD_DIR)
@@ -179,7 +179,9 @@ $(BUILD_DIR)/libisam.a: $(ISAM_OBJECTS)
 	$(RANLIB) $@
 
 $(MAIN_OBJECT): src/main.c | $(OBJ_DIR)/src $(HTSLIB_LIB) $(LMDB_LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -fvisibility=hidden -fPIC -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -fvisibility=hidden -fPIC -MMD -MP -c $< -o $@
+
+-include $(ISAM_OBJECTS:.o=.d) $(MAIN_OBJECT:.o=.d)
 
 $(BUILD_DIR)/isamtools: $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB)
 	$(CC) $(LDFLAGS) $(EXE_LDFLAGS) -o $@ $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB) $(SYS_LIBS)

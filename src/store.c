@@ -3,8 +3,10 @@
 
 #include <htslib/hts.h>
 #include <htslib/bgzf.h>
+#include <htslib/cram.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdlib.h>
 
 typedef struct payload_cache_entry {
     int64_t  read_id;
@@ -25,6 +27,161 @@ struct payload_cache {
 
 static size_t bam_payload_bytes(const bam1_t *b) {
     return b ? sizeof *b + (size_t)b->m_data : 0;
+}
+
+/* ---- fetch instrumentation (enable with ISAM_FETCH_STATS=1) ---------- */
+static long long g_fs_voffset = 0;
+static long long g_fs_cramloc_call = 0, g_fs_cramloc_hit = 0, g_fs_cramloc_decode = 0;
+static long long g_fs_cram_decode_recs = 0;
+static long long g_fs_iter_call = 0, g_fs_iter_mapped = 0, g_fs_iter_unmapped = 0;
+
+/* ---- CRAM decoded-slice LRU cache -------------------------------------
+ * CRAM random access is slice/container granular: fetching one read means
+ * seeking to its container and decoding the whole slice. This cache holds a
+ * bounded set of decoded containers keyed by byte offset, so consecutive reads
+ * from the same container decode it once, not once per read. Eviction is
+ * least-recently-used down to a byte budget. */
+
+typedef struct cram_slice {
+    int64_t   coffset;    /* container byte offset; -1 = free slot */
+    bam1_t  **recs;       /* recs[0..nrec-1], owned */
+    int       nrec;
+    size_t    bytes;
+    uint64_t  last_used;
+} cram_slice_t;
+
+struct cram_slice_cache {
+    cram_slice_t *slots;
+    int      cap;
+    size_t   max_bytes;
+    size_t   used_bytes;
+    uint64_t clock;
+};
+
+static cram_slice_cache_t *cram_slice_cache_create(size_t max_bytes) {
+    cram_slice_cache_t *c = xcalloc(1, sizeof *c);
+    c->max_bytes = max_bytes ? max_bytes : (size_t)256 * 1024 * 1024;
+    c->cap = 4096;
+    c->slots = xcalloc((size_t)c->cap, sizeof *c->slots);
+    for (int i = 0; i < c->cap; ++i) c->slots[i].coffset = -1;
+    return c;
+}
+
+static void cram_slice_free(cram_slice_t *s) {
+    if (s->recs) {
+        for (int i = 0; i < s->nrec; ++i)
+            if (s->recs[i]) bam_destroy1(s->recs[i]);
+        free(s->recs);
+        s->recs = NULL;
+    }
+    s->nrec = 0;
+    s->coffset = -1;
+    s->bytes = 0;
+}
+
+static void cram_slice_cache_destroy(cram_slice_cache_t *c) {
+    if (!c) return;
+    for (int i = 0; i < c->cap; ++i) cram_slice_free(&c->slots[i]);
+    free(c->slots);
+    free(c);
+}
+
+static int cram_slice_cache_find(cram_slice_cache_t *c, int64_t coffset) {
+    for (int i = 0; i < c->cap; ++i)
+        if (c->slots[i].coffset == coffset) return i;
+    return -1;
+}
+
+/* A free slot, else evict the least-recently-used occupied slot and reuse it. */
+static int cram_slice_cache_victim(cram_slice_cache_t *c) {
+    int lru = -1;
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < c->cap; ++i) {
+        if (c->slots[i].coffset < 0) return i;
+        if (c->slots[i].last_used < best) { best = c->slots[i].last_used; lru = i; }
+    }
+    c->used_bytes -= c->slots[lru].bytes;
+    cram_slice_free(&c->slots[lru]);
+    return lru;
+}
+
+/* nrec for a container, from the (ascending) offset table. */
+static int cram_container_nrec(store_t *st, int64_t coffset) {
+    int64_t lo = 0, hi = st->cram_nc - 1;
+    while (lo <= hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (st->cram_coff[mid] == coffset) return st->cram_nrec[mid];
+        if (st->cram_coff[mid] < coffset) lo = mid + 1; else hi = mid - 1;
+    }
+    die("cram container offset %lld not in table for '%s'",
+        (long long)coffset, st->store_path);
+    return 0;
+}
+
+static void cram_slice_decode(store_t *st, int64_t coffset, int nrec,
+                              cram_slice_t *slot) {
+    cram_fd *fd = st->sam->fp.cram;
+    if (cram_seek(fd, (off_t)coffset, SEEK_SET) < 0)
+        die("cram_seek to container %lld failed in '%s'",
+            (long long)coffset, st->store_path);
+    slot->recs = xmalloc((size_t)nrec * sizeof *slot->recs);
+    slot->nrec = nrec;
+    slot->coffset = coffset;
+    slot->bytes = 0;
+    for (int i = 0; i < nrec; ++i) {
+        bam1_t *r = bam_init1();
+        int rc = sam_read1(st->sam, st->hdr, r);
+        if (rc < 0)
+            die("sam_read1 (%d/%d) in CRAM container %lld of '%s' failed (rc=%d); "
+                "is the reference set (-T)?", i, nrec, (long long)coffset,
+                st->store_path, rc);
+        slot->recs[i] = r;
+        slot->bytes += sizeof(bam1_t) + (size_t)r->m_data;
+    }
+}
+
+/* Fetch payload by CRAM container locator (container offset + within index). */
+static int fetch_cram_loc(store_t *st, const char *qname,
+                          int64_t coffset, int32_t within, bam1_t *out) {
+    cram_slice_cache_t *c = st->slice_cache;
+    ++g_fs_cramloc_call;
+    int idx = cram_slice_cache_find(c, coffset);
+    if (idx >= 0) ++g_fs_cramloc_hit;
+    if (idx < 0) {
+        ++g_fs_cramloc_decode;
+        int nrec = cram_container_nrec(st, coffset);
+        g_fs_cram_decode_recs += nrec;
+        if (within < 0 || within >= nrec)
+            die("cram within-index %d out of range [0,%d) for container %lld in '%s'",
+                within, nrec, (long long)coffset, st->store_path);
+        idx = cram_slice_cache_victim(c);
+        cram_slice_decode(st, coffset, nrec, &c->slots[idx]);
+        c->used_bytes += c->slots[idx].bytes;
+        while (c->used_bytes > c->max_bytes) {
+            int v = -1;
+            uint64_t best = UINT64_MAX;
+            for (int i = 0; i < c->cap; ++i) {
+                if (i == idx || c->slots[i].coffset < 0) continue;
+                if (c->slots[i].last_used < best) { best = c->slots[i].last_used; v = i; }
+            }
+            if (v < 0) break;
+            c->used_bytes -= c->slots[v].bytes;
+            cram_slice_free(&c->slots[v]);
+        }
+    }
+    cram_slice_t *s = &c->slots[idx];
+    s->last_used = ++c->clock;
+    if (within < 0 || within >= s->nrec)
+        die("cram within-index %d >= %d records in container %lld of '%s'",
+            within, s->nrec, (long long)coffset, st->store_path);
+    bam1_t *r = s->recs[within];
+    const char *got = bam_get_qname(r);
+    if (!got || strcmp(got, qname) != 0)
+        die("cram locator stale: expected qname '%s', got '%s' in '%s' "
+            "(rebuild store index with `isamtools index`)",
+            qname, got ? got : "<null>", st->store_path);
+    if (!bam_copy1(out, r)) die("bam_copy1 failed");
+    return 0;
 }
 
 store_t *store_open(const char *store_path, const char *index_path) {
@@ -53,11 +210,46 @@ store_t *store_open(const char *store_path, const char *index_path) {
     st->hdr = sam_hdr_read(st->sam);
     if (!st->hdr) die("cannot read header of canonical store '%s'", store_path);
 
+    /* CRAM canonical: load the container table and set up the slice cache.
+     * A store indexed before v2 has no table; such CRAM stores fall back to
+     * the coordinate-iteration payload fetch. */
+    if (!st->is_bam &&
+        lmdb_store_get_cram_container_table(st->lmdb, &st->cram_coff,
+                                            &st->cram_nrec, &st->cram_nc)) {
+        /* Decoded-slice cache budget. A PacBio CRAM container decodes to
+         * ~250 MB (10k reads x SEQ/QUAL/methylation), so the old 256 MB default
+         * held ~1 container and thrashed: supplementary/secondary alignments
+         * verify against the canonical payload stored at the *primary's*
+         * coordinate, which back-jumps to distant containers and forced a full
+         * re-decode per read (~40x read amplification observed). Default to a
+         * large budget (nodes here have 100s of GB RAM); tune with
+         * ISAM_SLICE_CACHE_MB. */
+        size_t cache_mb = 8192;
+        const char *env = getenv("ISAM_SLICE_CACHE_MB");
+        if (env && *env) {
+            long v = strtol(env, NULL, 10);
+            if (v > 0) cache_mb = (size_t)v;
+        }
+        st->slice_cache = cram_slice_cache_create(cache_mb * 1024 * 1024);
+    }
+
     return st;
 }
 
 void store_close(store_t *st) {
     if (!st) return;
+    if (getenv("ISAM_FETCH_STATS")) {
+        long long cl = g_fs_cramloc_call;
+        fprintf(stderr,
+            "isamtools fetch-stats: voffset=%lld cram_loc=%lld (hit=%lld miss/decode=%lld, "
+            "hit%%=%.1f, decoded_recs=%lld) iter=%lld (mapped=%lld unmapped=%lld)\n",
+            g_fs_voffset, cl, g_fs_cramloc_hit, g_fs_cramloc_decode,
+            cl ? 100.0 * (double)g_fs_cramloc_hit / (double)cl : 0.0,
+            g_fs_cram_decode_recs, g_fs_iter_call, g_fs_iter_mapped, g_fs_iter_unmapped);
+    }
+    cram_slice_cache_destroy(st->slice_cache);
+    free(st->cram_coff);
+    free(st->cram_nrec);
     if (st->lmdb) lmdb_backend_close(st->lmdb);
     if (st->hdr)      sam_hdr_destroy(st->hdr);
     if (st->sam)      sam_close(st->sam);
@@ -83,6 +275,9 @@ static void fill_record_from_lmdb(lmdb_store_record_t *lr, store_record_t *out) 
     out->is_unmapped = lr->is_unmapped;
     out->bam_voffset = lr->bam_voffset;
     out->has_voffset = lr->has_voffset;
+    out->cram_coffset = lr->cram_coffset;
+    out->cram_within = lr->cram_within;
+    out->has_cram_loc = lr->has_cram_loc;
 }
 
 int store_lookup_qname(store_t *st, const char *qname, store_record_t *out) {
@@ -129,6 +324,8 @@ static int fetch_bam_voffset(store_t *st, const char *qname,
 /* Fetch payload by region iteration; verify QNAME. */
 static int fetch_iter(store_t *st, const char *qname,
                       int tid, int64_t pos0, bam1_t *out) {
+    ++g_fs_iter_call;
+    if (tid < 0 || pos0 < 0) ++g_fs_iter_unmapped; else ++g_fs_iter_mapped;
     /* Need the BAM/CRAM index for region queries. */
     static __thread hts_idx_t *cached_idx = NULL;
     static __thread store_t   *cached_st  = NULL;
@@ -171,8 +368,12 @@ static int fetch_iter(store_t *st, const char *qname,
 
 int store_fetch_payload(store_t *st, const char *qname,
                         const store_record_t *rec, bam1_t *out) {
-    if (st->is_bam && rec->has_voffset && rec->bam_voffset >= 0)
+    if (st->is_bam && rec->has_voffset && rec->bam_voffset >= 0) {
+        ++g_fs_voffset;
         return fetch_bam_voffset(st, qname, rec->bam_voffset, out);
+    }
+    if (!st->is_bam && rec->has_cram_loc && rec->cram_coffset >= 0 && st->slice_cache)
+        return fetch_cram_loc(st, qname, rec->cram_coffset, rec->cram_within, out);
     return fetch_iter(st, qname,
                       rec->is_unmapped ? -1 : rec->tid,
                       rec->is_unmapped ? -1 : rec->pos0,

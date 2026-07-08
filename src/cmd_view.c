@@ -930,6 +930,9 @@ int cmd_view(int argc, char **argv) {
 
     view_t *v = view_open_read(isam_path);
     view_link_store(v, store_override, store_idx_override);
+    if (!v->store->is_bam && !reference_path)
+        die("canonical store '%s' is CRAM; -T/--reference is required to decode read payload",
+            v->store->store_path);
     if (qname_path) {
         filter.qname_filter_active = 1;
         load_qname_file(v, &filter.qname_ids, qname_path);

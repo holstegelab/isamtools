@@ -37,6 +37,16 @@ typedef struct lmdb_backend {
     size_t view_record_zstd_sample_sizes[1000];
     unsigned view_record_zstd_sample_count;
     int view_record_zstd_training_done;
+    /* Persistent zstd contexts + pre-digested dictionaries. Reused across every
+     * record so the per-record ZSTD_createCCtx/CDict-digestion cost (the import
+     * throughput bottleneck) is paid once, not per read. void* to keep zstd.h
+     * out of this header; cast in backend_lmdb.c. */
+    void *zstd_cctx;             /* ZSTD_CCtx*  */
+    void *zstd_dctx;             /* ZSTD_DCtx*  */
+    void *read_aux_cdict;        /* ZSTD_CDict* */
+    void *read_aux_ddict;        /* ZSTD_DDict* */
+    void *view_record_cdict;     /* ZSTD_CDict* */
+    void *view_record_ddict;     /* ZSTD_DDict* */
 } lmdb_backend_t;
 
 typedef struct lmdb_store_record {
@@ -48,8 +58,11 @@ typedef struct lmdb_store_record {
     int64_t end0;
     int flag;
     int is_unmapped;
-    int64_t bam_voffset;
+    int64_t bam_voffset;        /* BAM payload hint: BGZF virtual offset (-1 if absent) */
     int has_voffset;
+    int64_t cram_coffset;       /* CRAM payload hint: byte offset of the container (-1 if absent) */
+    int32_t cram_within;        /* CRAM payload hint: record index within that container */
+    int has_cram_loc;
 } lmdb_store_record_t;
 
 typedef struct lmdb_view_record {
@@ -108,6 +121,14 @@ void            lmdb_store_put_record(lmdb_backend_t *b,
                                       const lmdb_store_record_t *rec);
 void            lmdb_store_update_record(lmdb_backend_t *b,
                                          const lmdb_store_record_t *rec);
+void            lmdb_store_put_cram_container_table(lmdb_backend_t *b,
+                                                    const int64_t *coffset,
+                                                    const int32_t *nrecords,
+                                                    int64_t n_containers);
+int             lmdb_store_get_cram_container_table(lmdb_backend_t *b,
+                                                    int64_t **coffset_out,
+                                                    int32_t **nrecords_out,
+                                                    int64_t *n_containers_out);
 int             lmdb_store_lookup_qname(lmdb_backend_t *b,
                                         int64_t qname_hash,
                                         const char *qname,
