@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <zstd.h>
 #include <zdict.h>
+#include <htslib/thread_pool.h>
 
 static void lmdb_die(int rc, const char *op, const char *path) {
     die("lmdb %s failed for '%s': %s", op, path, mdb_strerror(rc));
@@ -235,15 +236,18 @@ static int key_has_prefix(const MDB_val *key, const unsigned char *prefix,
 }
 
 /* Record version 2 adds the CRAM payload locator (has_cram_loc, cram_coffset,
- * cram_within) in place of version 1's trailing reserved u32. Version 1 records
- * are still decoded (with no CRAM locator) so BAM-canonical stores stay valid. */
+ * cram_within) in place of version 1's trailing reserved u32. Version 3 appends
+ * compact canonical shared-tag fingerprints. Older records remain readable. */
 static MDB_val encode_record(const lmdb_store_record_t *rec) {
     size_t qn = strlen(rec->qname);
     if (qn > UINT16_MAX) die("qname too long for lmdb record");
-    size_t n = 1 + 2 + qn + 8 + 8 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 4 + 8 + 4;
+    if (rec->n_tag_fingerprints > UINT16_MAX)
+        die("too many canonical tag fingerprints for '%s'", rec->qname);
+    size_t n = 1 + 2 + qn + 8 + 8 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 4 + 8 + 4 +
+               2 + rec->n_tag_fingerprints * (2 + 8);
     unsigned char *buf = xmalloc(n);
     unsigned char *p = buf;
-    *p++ = 2;
+    *p++ = 3;
     put_u16(&p, (uint16_t)qn);
     memcpy(p, rec->qname, qn); p += qn;
     put_u64(&p, (uint64_t)rec->read_id);
@@ -258,6 +262,11 @@ static MDB_val encode_record(const lmdb_store_record_t *rec) {
     put_u32(&p, (uint32_t)rec->has_cram_loc);
     put_u64(&p, (uint64_t)rec->cram_coffset);
     put_u32(&p, (uint32_t)rec->cram_within);
+    put_u16(&p, (uint16_t)rec->n_tag_fingerprints);
+    for (size_t i = 0; i < rec->n_tag_fingerprints; ++i) {
+        put_u16(&p, rec->tag_fingerprints[i].tag_code);
+        put_u64(&p, rec->tag_fingerprints[i].fingerprint);
+    }
     MDB_val val = { n, buf };
     return val;
 }
@@ -268,7 +277,7 @@ static void decode_record(MDB_val *val, lmdb_store_record_t *out) {
     const unsigned char *end = p + val->mv_size;
     if (p >= end) die("truncated lmdb canonical record");
     unsigned char version = *p++;
-    if (version != 1 && version != 2)
+    if (version != 1 && version != 2 && version != 3)
         die("unsupported lmdb canonical record version %u", version);
     uint16_t qn = get_u16(&p);
     if (p + qn > end) die("truncated lmdb canonical record");
@@ -285,19 +294,36 @@ static void decode_record(MDB_val *val, lmdb_store_record_t *out) {
     out->is_unmapped = (int32_t)get_u32(&p);
     out->has_voffset = (int32_t)get_u32(&p);
     out->bam_voffset = (int64_t)get_u64(&p);
-    if (version == 2) {
+    if (version >= 2) {
         out->has_cram_loc = (int32_t)get_u32(&p);
         out->cram_coffset = (int64_t)get_u64(&p);
         out->cram_within = (int32_t)get_u32(&p);
     } else {
         (void)get_u32(&p); /* v1 reserved */
     }
+    if (version == 3) {
+        if (p + 2 > end)
+            die("truncated canonical tag fingerprint count");
+        uint16_t count = get_u16(&p);
+        if (p + (size_t)count * (2 + 8) != end)
+            die("corrupt canonical tag fingerprints");
+        if (count > 0)
+            out->tag_fingerprints = xmalloc((size_t)count *
+                                            sizeof *out->tag_fingerprints);
+        out->n_tag_fingerprints = count;
+        out->has_tag_fingerprints = 1;
+        for (uint16_t i = 0; i < count; ++i) {
+            out->tag_fingerprints[i].tag_code = get_u16(&p);
+            out->tag_fingerprints[i].fingerprint = get_u64(&p);
+        }
+    }
 }
 
 static int decode_record_flag(const MDB_val *val) {
     const unsigned char *p = val->mv_data;
     const unsigned char *end = p + val->mv_size;
-    if (p >= end || (*p != 1 && *p != 2)) die("unsupported lmdb canonical record version");
+    if (p >= end || (*p != 1 && *p != 2 && *p != 3))
+        die("unsupported lmdb canonical record version");
     p++;
     uint16_t qn = get_u16(&p);
     if (p + qn > end) die("truncated lmdb canonical record");
@@ -528,7 +554,8 @@ static void append_read_tag_value(bam1_t *record,
     die("unsupported read_tag type '%c' for '%s'", type, tag);
 }
 
-#define ISAM_ZSTD_LEVEL 3
+#define ISAM_READ_AUX_ZSTD_LEVEL 3
+#define ISAM_VIEW_RECORD_ZSTD_LEVEL 1
 
 /* Persistent zstd contexts, created lazily and reused for every record. */
 static void lmdb_zstd_ensure_ctx(lmdb_backend_t *b) {
@@ -550,7 +577,8 @@ static void lmdb_zstd_refresh_read_aux(lmdb_backend_t *b) {
     if (b->read_aux_ddict) { ZSTD_freeDDict((ZSTD_DDict *)b->read_aux_ddict); b->read_aux_ddict = NULL; }
     if (b->read_aux_zstd_dict && b->read_aux_zstd_dict_len) {
         b->read_aux_cdict = ZSTD_createCDict(b->read_aux_zstd_dict,
-                                             b->read_aux_zstd_dict_len, ISAM_ZSTD_LEVEL);
+                                             b->read_aux_zstd_dict_len,
+                                             ISAM_READ_AUX_ZSTD_LEVEL);
         b->read_aux_ddict = ZSTD_createDDict(b->read_aux_zstd_dict,
                                              b->read_aux_zstd_dict_len);
         if (!b->read_aux_cdict || !b->read_aux_ddict)
@@ -563,7 +591,8 @@ static void lmdb_zstd_refresh_view_record(lmdb_backend_t *b) {
     if (b->view_record_ddict) { ZSTD_freeDDict((ZSTD_DDict *)b->view_record_ddict); b->view_record_ddict = NULL; }
     if (b->view_record_zstd_dict && b->view_record_zstd_dict_len) {
         b->view_record_cdict = ZSTD_createCDict(b->view_record_zstd_dict,
-                                                b->view_record_zstd_dict_len, ISAM_ZSTD_LEVEL);
+                                                b->view_record_zstd_dict_len,
+                                                ISAM_VIEW_RECORD_ZSTD_LEVEL);
         b->view_record_ddict = ZSTD_createDDict(b->view_record_zstd_dict,
                                                 b->view_record_zstd_dict_len);
         if (!b->view_record_cdict || !b->view_record_ddict)
@@ -729,30 +758,211 @@ static MDB_val encode_view_record_raw(const lmdb_view_record_t *rec) {
     return val;
 }
 
-static MDB_val encode_view_record(lmdb_backend_t *b,
-                                  const lmdb_view_record_t *rec) {
-    MDB_val raw = encode_view_record_raw(rec);
-    int use_zstd = b->view_record_cdict && raw.mv_size > 0;
+static MDB_val compress_view_record_with_ctx(lmdb_backend_t *b,
+                                             ZSTD_CCtx *cctx,
+                                             const MDB_val *raw) {
+    int use_zstd = b->view_record_cdict && raw->mv_size > 0;
     if (!use_zstd)
-        return raw;
+        die("view record compression requested without a zstd dictionary");
 
-    if (raw.mv_size > UINT32_MAX)
+    if (raw->mv_size > UINT32_MAX)
         die("lmdb view record too long");
-    size_t bound = ZSTD_compressBound(raw.mv_size);
+    size_t bound = ZSTD_compressBound(raw->mv_size);
     size_t n = 1 + 1 + 4 + bound;
     unsigned char *buf = xmalloc(n);
     unsigned char *p = buf;
     *p++ = 2;
     *p++ = 1;
-    put_u32(&p, (uint32_t)raw.mv_size);
-    lmdb_zstd_ensure_ctx(b);
-    size_t csz = ZSTD_compress_usingCDict((ZSTD_CCtx *)b->zstd_cctx, p, bound,
-                                          raw.mv_data, raw.mv_size,
+    put_u32(&p, (uint32_t)raw->mv_size);
+    size_t csz = ZSTD_compress_usingCDict(cctx, p, bound,
+                                          raw->mv_data, raw->mv_size,
                                           (ZSTD_CDict *)b->view_record_cdict);
     if (ZSTD_isError(csz))
         die("zstd compress lmdb view record failed: %s", ZSTD_getErrorName(csz));
-    free(raw.mv_data);
     MDB_val val = { 1 + 1 + 4 + csz, buf };
+    return val;
+}
+
+static MDB_val compress_view_record(lmdb_backend_t *b,
+                                    const MDB_val *raw) {
+    lmdb_zstd_ensure_ctx(b);
+    return compress_view_record_with_ctx(b, (ZSTD_CCtx *)b->zstd_cctx, raw);
+}
+
+typedef struct lmdb_import_task {
+    struct lmdb_import_pipeline *pipeline;
+    int64_t aln_id;
+    int64_t store_read_id;
+    int64_t record_order;
+    MDB_val raw;
+    MDB_val value;
+} lmdb_import_task_t;
+
+typedef struct lmdb_import_pipeline {
+    lmdb_backend_t *backend;
+    hts_tpool *pool;
+    hts_tpool_process *queue;
+    ZSTD_CCtx **contexts;
+    int n_threads;
+    int queue_size;
+    int outstanding;
+} lmdb_import_pipeline_t;
+
+static void lmdb_view_write_import_value(lmdb_backend_t *b,
+                                         int64_t aln_id,
+                                         int64_t store_read_id,
+                                         int64_t record_order,
+                                         const MDB_val *value) {
+    int owned = 0;
+    MDB_txn *txn = write_txn(b, &owned);
+
+    unsigned char idbuf[8];
+    be64_key(aln_id, idbuf);
+    MDB_val idkey = { sizeof idbuf, idbuf };
+    int rc = mdb_put(txn, b->aln_by_id, &idkey, (MDB_val *)value,
+                     MDB_NOOVERWRITE);
+    if (rc) lmdb_die(rc, "put(aln_by_id)", b->path);
+
+    unsigned char refbuf[8];
+    unsigned char *p = refbuf;
+    put_u64(&p, (uint64_t)aln_id);
+    MDB_val refval = { sizeof refbuf, refbuf };
+
+    MDB_val okey = order_key(record_order, aln_id);
+    rc = mdb_put(txn, b->aln_import_by_order, &okey, &refval, 0);
+    if (rc) lmdb_die(rc, "put(aln_import_by_order)", b->path);
+
+    MDB_val rkey = read_aln_key(store_read_id, record_order, aln_id);
+    rc = mdb_put(txn, b->aln_by_read, &rkey, &refval, 0);
+    if (rc) lmdb_die(rc, "put(aln_by_read)", b->path);
+
+    free(okey.mv_data);
+    free(rkey.mv_data);
+    write_txn_finish(b, txn, owned);
+}
+
+static void *lmdb_import_compress_task(void *arg) {
+    lmdb_import_task_t *task = arg;
+    lmdb_import_pipeline_t *pipeline = task->pipeline;
+    int worker_id = hts_tpool_worker_id(pipeline->pool);
+    if (worker_id < 0 || worker_id >= pipeline->n_threads)
+        die("cannot identify import compression worker");
+    if (!pipeline->contexts[worker_id]) {
+        pipeline->contexts[worker_id] = ZSTD_createCCtx();
+        if (!pipeline->contexts[worker_id])
+            die("zstd create import compression context failed");
+    }
+    task->value = compress_view_record_with_ctx(
+        pipeline->backend, pipeline->contexts[worker_id], &task->raw);
+    free(task->raw.mv_data);
+    task->raw = (MDB_val){ 0, NULL };
+    return task;
+}
+
+static int lmdb_view_drain_import_result(lmdb_backend_t *b, int wait) {
+    lmdb_import_pipeline_t *pipeline = b->import_pipeline;
+    if (!pipeline || pipeline->outstanding == 0)
+        return 0;
+    hts_tpool_result *result = wait
+        ? hts_tpool_next_result_wait(pipeline->queue)
+        : hts_tpool_next_result(pipeline->queue);
+    if (!result) {
+        if (wait)
+            die("import compression queue ended before all records completed");
+        return 0;
+    }
+    lmdb_import_task_t *task = hts_tpool_result_data(result);
+    if (!task)
+        die("import compression worker returned no record");
+    lmdb_view_write_import_value(b, task->aln_id, task->store_read_id,
+                                 task->record_order, &task->value);
+    free(task->value.mv_data);
+    free(task);
+    hts_tpool_delete_result(result, 0);
+    --pipeline->outstanding;
+    return 1;
+}
+
+static void lmdb_view_flush_import_pipeline(lmdb_backend_t *b) {
+    lmdb_import_pipeline_t *pipeline = b->import_pipeline;
+    if (!pipeline)
+        return;
+    while (pipeline->outstanding > 0)
+        lmdb_view_drain_import_result(b, 1);
+}
+
+static void lmdb_view_destroy_import_pipeline(lmdb_backend_t *b) {
+    lmdb_import_pipeline_t *pipeline = b->import_pipeline;
+    if (!pipeline)
+        return;
+    lmdb_view_flush_import_pipeline(b);
+    hts_tpool_process_destroy(pipeline->queue);
+    hts_tpool_destroy(pipeline->pool);
+    for (int i = 0; i < pipeline->n_threads; ++i)
+        if (pipeline->contexts[i]) ZSTD_freeCCtx(pipeline->contexts[i]);
+    free(pipeline->contexts);
+    free(pipeline);
+    b->import_pipeline = NULL;
+}
+
+void lmdb_view_set_import_compression_threads(lmdb_backend_t *b,
+                                              int n_threads) {
+    if (b->readonly)
+        die("cannot configure import compression on readonly backend '%s'",
+            b->path);
+    if (n_threads < 0)
+        die("negative import compression thread count");
+    if (b->import_pipeline)
+        die("import compression is already configured for '%s'", b->path);
+    if (n_threads == 0)
+        return;
+
+    lmdb_import_pipeline_t *pipeline = xcalloc(1, sizeof *pipeline);
+    pipeline->backend = b;
+    pipeline->n_threads = n_threads;
+    pipeline->queue_size = 128 * n_threads;
+    pipeline->contexts = xcalloc((size_t)n_threads,
+                                 sizeof *pipeline->contexts);
+    pipeline->pool = hts_tpool_init(n_threads);
+    if (!pipeline->pool)
+        die("cannot create import compression thread pool");
+    pipeline->queue = hts_tpool_process_init(pipeline->pool,
+                                              pipeline->queue_size, 0);
+    if (!pipeline->queue)
+        die("cannot create import compression queue");
+    b->import_pipeline = pipeline;
+}
+
+static void lmdb_view_submit_import_record(lmdb_backend_t *b,
+                                           const lmdb_view_record_t *rec,
+                                           MDB_val raw) {
+    lmdb_import_pipeline_t *pipeline = b->import_pipeline;
+    while (pipeline->outstanding >= pipeline->queue_size)
+        lmdb_view_drain_import_result(b, 1);
+
+    lmdb_import_task_t *task = xcalloc(1, sizeof *task);
+    task->pipeline = pipeline;
+    task->aln_id = rec->aln_id;
+    task->store_read_id = rec->store_read_id;
+    task->record_order = rec->record_order;
+    task->raw = raw;
+    if (hts_tpool_dispatch(pipeline->pool, pipeline->queue,
+                           lmdb_import_compress_task, task) != 0) {
+        free(raw.mv_data);
+        free(task);
+        die("cannot submit import record for background compression");
+    }
+    ++pipeline->outstanding;
+    while (lmdb_view_drain_import_result(b, 0)) {}
+}
+
+static MDB_val encode_view_record(lmdb_backend_t *b,
+                                  const lmdb_view_record_t *rec) {
+    MDB_val raw = encode_view_record_raw(rec);
+    if (!b->view_record_zstd_dict_len)
+        return raw;
+    MDB_val val = compress_view_record(b, &raw);
+    free(raw.mv_data);
     return val;
 }
 
@@ -990,6 +1200,7 @@ lmdb_backend_t *lmdb_backend_open(const char *path, int readonly,
 
 void lmdb_backend_close(lmdb_backend_t *b) {
     if (!b) return;
+    lmdb_view_destroy_import_pipeline(b);
     if (b->write_txn) lmdb_backend_abort(b);
     if (b->env) {
         mdb_dbi_close(b->env, b->meta);
@@ -1032,6 +1243,7 @@ void lmdb_backend_begin(lmdb_backend_t *b) {
 }
 
 void lmdb_backend_commit(lmdb_backend_t *b) {
+    lmdb_view_flush_import_pipeline(b);
     if (!b->write_txn) return;
     MDB_txn *txn = b->write_txn;
     b->write_txn = NULL;
@@ -1306,8 +1518,20 @@ int lmdb_store_lookup_qname(lmdb_backend_t *b,
     if (rc) lmdb_die(rc, "get(canonical_by_qname)", b->path);
     const unsigned char *p = val.mv_data;
     int64_t read_id = (int64_t)get_u64(&p);
+
+    unsigned char idbuf[8];
+    be64_key(read_id, idbuf);
+    MDB_val idkey = { sizeof idbuf, idbuf };
+    rc = mdb_get(txn, b->canonical_by_id, &idkey, &val);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        die("store index '%s' maps QNAME '%s' to missing read id %lld",
+            b->path, qname, (long long)read_id);
+    }
+    if (rc) lmdb_die(rc, "get(canonical_by_id)", b->path);
+    decode_record(&val, out);
     mdb_txn_abort(txn);
-    return lmdb_store_lookup_read_id(b, read_id, out);
+    return 1;
 }
 
 struct lmdb_store_iter {
@@ -1352,6 +1576,7 @@ void lmdb_store_iter_close(lmdb_store_iter_t *it) {
 void lmdb_store_record_clear(lmdb_store_record_t *rec) {
     if (!rec) return;
     free(rec->qname);
+    free(rec->tag_fingerprints);
     memset(rec, 0, sizeof *rec);
 }
 
@@ -1389,7 +1614,13 @@ void lmdb_view_put_read(lmdb_backend_t *b,
     be64_key(store_read_id, idbuf);
     MDB_val idkey = { sizeof idbuf, idbuf };
     MDB_val val = encode_view_read(store_read_id, qname, hash);
-    int rc = mdb_put(txn, b->read_by_id, &idkey, &val, 0);
+    void *encoded_read = val.mv_data;
+    int rc = mdb_put(txn, b->read_by_id, &idkey, &val, MDB_NOOVERWRITE);
+    if (rc == MDB_KEYEXIST) {
+        free(encoded_read);
+        write_txn_finish(b, txn, owned);
+        return;
+    }
     if (rc) lmdb_die(rc, "put(read_by_id)", b->path);
 
     MDB_val qkey = qname_key(hash, qname);
@@ -1397,10 +1628,10 @@ void lmdb_view_put_read(lmdb_backend_t *b,
     unsigned char *p = ridbuf;
     put_u64(&p, (uint64_t)store_read_id);
     MDB_val ridval = { sizeof ridbuf, ridbuf };
-    rc = mdb_put(txn, b->read_by_qname, &qkey, &ridval, 0);
+    rc = mdb_put(txn, b->read_by_qname, &qkey, &ridval, MDB_NOOVERWRITE);
     if (rc) lmdb_die(rc, "put(read_by_qname)", b->path);
 
-    free(val.mv_data);
+    free(encoded_read);
     free(qkey.mv_data);
     write_txn_finish(b, txn, owned);
 }
@@ -1429,40 +1660,35 @@ int lmdb_view_lookup_qname(lmdb_backend_t *b,
 
 void lmdb_view_put_import_record(lmdb_backend_t *b,
                                  const lmdb_view_record_t *rec) {
-    int owned = 0;
-    MDB_txn *txn = write_txn(b, &owned);
     MDB_val raw = encode_view_record_raw(rec);
+    if (b->import_pipeline && b->view_record_zstd_dict_len > 0) {
+        lmdb_view_submit_import_record(b, rec, raw);
+        return;
+    }
     MDB_val val = b->view_record_zstd_dict_len > 0 ?
-                  encode_view_record(b, rec) : raw;
-
-    unsigned char idbuf[8];
-    be64_key(rec->aln_id, idbuf);
-    MDB_val idkey = { sizeof idbuf, idbuf };
-    int rc = mdb_put(txn, b->aln_by_id, &idkey, &val, MDB_NOOVERWRITE);
-    if (rc) lmdb_die(rc, "put(aln_by_id)", b->path);
+                  compress_view_record(b, &raw) : raw;
+    lmdb_view_write_import_value(b, rec->aln_id, rec->store_read_id,
+                                 rec->record_order, &val);
     if (val.mv_data == raw.mv_data)
         lmdb_view_record_maybe_train_zstd(b, &raw);
-
-    unsigned char refbuf[8];
-    unsigned char *p = refbuf;
-    put_u64(&p, (uint64_t)rec->aln_id);
-    MDB_val refval = { sizeof refbuf, refbuf };
-
-    MDB_val okey = order_key(rec->record_order, rec->aln_id);
-    rc = mdb_put(txn, b->aln_import_by_order, &okey, &refval, 0);
-    if (rc) lmdb_die(rc, "put(aln_import_by_order)", b->path);
-
-    MDB_val rkey = read_aln_key(rec->store_read_id, rec->record_order,
-                                rec->aln_id);
-    rc = mdb_put(txn, b->aln_by_read, &rkey, &refval, 0);
-    if (rc) lmdb_die(rc, "put(aln_by_read)", b->path);
-
-    free(okey.mv_data);
-    free(rkey.mv_data);
     free(val.mv_data);
     if (val.mv_data != raw.mv_data)
         free(raw.mv_data);
-    write_txn_finish(b, txn, owned);
+}
+
+int64_t lmdb_view_record_count(lmdb_backend_t *b) {
+    MDB_txn *txn = NULL;
+    int rc = mdb_txn_begin(b->env, NULL, MDB_RDONLY, &txn);
+    if (rc) lmdb_die(rc, "txn_begin", b->path);
+
+    MDB_stat stat;
+    rc = mdb_stat(txn, b->aln_by_id, &stat);
+    if (rc) lmdb_die(rc, "stat(aln_by_id)", b->path);
+    mdb_txn_abort(txn);
+
+    if (stat.ms_entries > INT64_MAX)
+        die("alignment record count exceeds int64 range in '%s'", b->path);
+    return (int64_t)stat.ms_entries;
 }
 
 static void lmdb_drop_clear(lmdb_backend_t *b, MDB_txn *txn,
@@ -2283,6 +2509,7 @@ lmdb_view_iter_t *lmdb_view_iter_open(lmdb_backend_t *b,
     MDB_dbi dbi = b->aln_import_by_order;
     if (kind == LMDB_VIEW_ITER_COORD) dbi = b->aln_by_coord;
     else if (kind == LMDB_VIEW_ITER_UNMAPPED) dbi = b->aln_unmapped;
+    else if (kind == LMDB_VIEW_ITER_RECORD) dbi = b->aln_by_id;
     else if (kind == LMDB_VIEW_ITER_REGION) {
         dbi = b->aln_by_coord;
         it->scan_start = checkpoint_scan_start(b, it->txn, tid, beg);
@@ -2510,6 +2737,10 @@ int lmdb_view_iter_next(lmdb_view_iter_t *it, lmdb_view_record_t *out) {
     if (it->kind == LMDB_VIEW_ITER_REGION) return iter_region_next(it, out);
     MDB_val key = { 0, NULL }, val = { 0, NULL };
     if (!iter_cursor_next(it, &key, &val)) return 0;
+    if (it->kind == LMDB_VIEW_ITER_RECORD) {
+        decode_view_record(it->b, &val, out);
+        return 1;
+    }
     return iter_decode_ref(it, &val, out, "aln_import_by_order");
 }
 

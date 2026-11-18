@@ -62,7 +62,8 @@ included, `sam_open`, `sam_read1`, etc. are `#define`d to the wrapping
 /path/to/isamtools/build/vendor/htslib/lib/libhts.a   \
 /path/to/isamtools/build/vendor/lmdb/lib/liblmdb.a    \
 /path/to/isamtools/build/vendor/bzip2/lib/libbz2.a    \
--lz -llzma -lpthread -lm
+/path/to/isamtools/build/vendor/libdeflate/lib/libdeflate.a \
+-lz -llzma -lpthread -lm -lzstd
 ```
 
 The vendored static archives in the isamtools build are not built with
@@ -133,7 +134,8 @@ LINK_LIBS   = $(ISAM_BUILD)/libisam.a                          \
               $(ISAM_BUILD)/vendor/htslib/lib/libhts.a         \
               $(ISAM_BUILD)/vendor/lmdb/lib/liblmdb.a          \
               $(ISAM_BUILD)/vendor/bzip2/lib/libbz2.a          \
-              -lwfacpp -lz -llzma -lpthread -lm -fopenmp
+              $(ISAM_BUILD)/vendor/libdeflate/lib/libdeflate.a \
+              -lwfacpp -lz -llzma -lpthread -lm -lzstd -fopenmp
 
 $(ODIR)/%.o: $(SDIR)/%.cpp | $(ODIR)
 	$(CXX) $(CXX_FLAGS) $(HTSISAM_CPPFLAGS) -MMD -MP -c -o $@ $< $(INC)
@@ -153,6 +155,16 @@ otter assemble -b regions.bed sample.isam  | md5sum
 Both produce identical bytes.
 
 ## Caveats and limits
+
+**Multi-node filesystem placement.** Stage `.isam` and `.ssam` as private
+node-local files before concurrent jobs open them. LMDB's mmap-backed reader
+locks are not supported across hosts on a shared filesystem such as GPFS.
+The canonical CRAM can remain on GPFS; resolve its path and the private store
+index correctly (native API: `store_path_override` and
+`store_index_path_override`). Do not disable locking for a database that might
+have a writer. For unmodified applications, the
+[temporary-BAM helper](temporary-bam.md) stages private indexes by default and
+supplies these path overrides.
 
 **Write mode is read-only for `.isam`.** `sam_open("path.isam", "wb")` is
 refused with a clear error. Writing a `.isam` is an import operation
@@ -213,13 +225,14 @@ From the isamtools project root:
 ```sh
 make                              # builds build/libisam.a + vendored deps
 ls build/libisam.a                # the static archive consumers link
-ls build/vendor/htslib/lib/libhts.a build/vendor/lmdb/lib/liblmdb.a
+ls build/vendor/htslib/lib/libhts.a build/vendor/lmdb/lib/liblmdb.a \
+   build/vendor/bzip2/lib/libbz2.a build/vendor/libdeflate/lib/libdeflate.a
 ls include/htsisam/sam.h          # the dropin header consumers `-include`
 ```
 
-Distribute `libisam.a`, the htslib + lmdb static archives, and the
+Distribute `libisam.a`, the htslib, LMDB, bzip2, and libdeflate static archives, and the
 `include/htsisam` and `include/isam` directories. Consumers add the include
-directory to `-I` and the three archives to their link line.
+directory to `-I` and the archives to their link line.
 
 ## When the wrapper is not enough
 

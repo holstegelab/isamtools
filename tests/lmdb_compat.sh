@@ -8,6 +8,7 @@ BUILD_ROOT=$(cd "$(dirname "$TOOL")" && pwd)
 HTSLIB_PREFIX=${HTSLIB_PREFIX:-$BUILD_ROOT/vendor/htslib}
 LMDB_PREFIX=${LMDB_PREFIX:-$BUILD_ROOT/vendor/lmdb}
 BZIP2_LIB=${BZIP2_LIB:-$BUILD_ROOT/vendor/bzip2/lib/libbz2.a}
+LIBDEFLATE_LIB=${LIBDEFLATE_LIB:-$BUILD_ROOT/vendor/libdeflate/lib/libdeflate.a}
 HTSLIB_INC=$HTSLIB_PREFIX/include
 HTSLIB_LIB=$HTSLIB_PREFIX/lib/libhts.a
 LMDB_LIB=$LMDB_PREFIX/lib/liblmdb.a
@@ -16,6 +17,11 @@ if [[ -f $BZIP2_LIB ]]; then
     BZIP2_LINK=("$BZIP2_LIB")
 else
     BZIP2_LINK=(-lbz2)
+fi
+if [[ -f $LIBDEFLATE_LIB ]]; then
+    LIBDEFLATE_LINK=("$LIBDEFLATE_LIB")
+else
+    LIBDEFLATE_LINK=()
 fi
 
 [[ -x $TOOL ]] || { echo "built isamtools not found: $TOOL"; exit 1; }
@@ -176,16 +182,18 @@ fi
 [[ $(awk 'END { print NR }' "$WORK/unmap.sam") == 5 ]]
 awk '$1=="qShort" { if (int($2 / 4) % 2 == 0) exit 1; found = 1 } END { exit found ? 0 : 1 }' "$WORK/unmap.sam"
 awk '$1=="qPair" && $4==900 { if (int($2 / 4) % 2 != 0) exit 1; found = 1 } END { exit found ? 0 : 1 }' "$WORK/unmap.sam"
-"$TOOL" view -H "$WORK/view.isam" | grep -q '^@SQ[[:space:]]SN:chrV'
-if "$TOOL" view "$WORK/view.isam" | grep -q '^@'; then
+# Consume the whole pipe: grep -q can close it after the header and make a
+# successful producer fail with SIGPIPE under set -o pipefail.
+"$TOOL" view -H "$WORK/view.isam" | grep '^@SQ[[:space:]]SN:chrV' >/dev/null
+if "$TOOL" view "$WORK/view.isam" | grep '^@' >/dev/null; then
     echo "default SAM view emitted header records"
     exit 1
 fi
-if "$TOOL" view --no-header "$WORK/view.isam" | grep -q '^@'; then
+if "$TOOL" view --no-header "$WORK/view.isam" | grep '^@' >/dev/null; then
     echo "--no-header emitted header records"
     exit 1
 fi
-if ! "$TOOL" view -h "$WORK/view.isam" | grep -q '^@SQ[[:space:]]SN:chrV'; then
+if ! "$TOOL" view -h "$WORK/view.isam" | grep '^@SQ[[:space:]]SN:chrV' >/dev/null; then
     echo "-h did not emit SAM header records"
     exit 1
 fi
@@ -291,7 +299,8 @@ C
 
 cc -no-pie -I"$ROOT/include" -I"$HTSLIB_INC" \
     "$WORK/c_api_lmdb.c" "$BUILD_ROOT/libisam.a" \
-    "$LMDB_LIB" "$HTSLIB_LIB" "${BZIP2_LINK[@]}" -lz -llzma -lm -lpthread -lzstd -o "$WORK/c_api_lmdb"
+    "$LMDB_LIB" "$HTSLIB_LIB" "${BZIP2_LINK[@]}" "${LIBDEFLATE_LINK[@]}" \
+    -lz -llzma -lm -lpthread -lzstd -o "$WORK/c_api_lmdb"
 "$WORK/c_api_lmdb" "$WORK/view.isam"
 
 echo "lmdb compat OK"

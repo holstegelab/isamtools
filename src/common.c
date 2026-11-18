@@ -1,5 +1,7 @@
 #include <stdarg.h>
 #include <time.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "common.h"
 
@@ -81,6 +83,34 @@ char *isam_index_path_for(const char *input_path) {
 
 char *isam_store_index_path_for(const char *store_path) {
     return index_path_for(store_path, ".ssam");
+}
+
+static int path_is_absolute_or_uri(const char *path) {
+    return path[0] == '/' || strstr(path, "://") != NULL;
+}
+
+char *isam_path_absolute(const char *path) {
+    if (!path || path_is_absolute_or_uri(path)) return xstrdup(path);
+    char *cwd = getcwd(NULL, 0);
+    if (!cwd) die("getcwd failed: %s", strerror(errno));
+    size_t prefix = strlen(cwd);
+    char *resolved = xmalloc(prefix + 1 + strlen(path) + 1);
+    memcpy(resolved, cwd, prefix);
+    resolved[prefix] = '/';
+    strcpy(resolved + prefix + 1, path);
+    free(cwd);
+    return resolved;
+}
+
+char *isam_path_relative_to_index(const char *index_path, const char *path) {
+    if (!path || path_is_absolute_or_uri(path)) return xstrdup(path);
+    const char *slash = strrchr(index_path, '/');
+    if (!slash) return xstrdup(path);
+    size_t prefix = (size_t)(slash - index_path) + 1;
+    char *resolved = xmalloc(prefix + strlen(path) + 1);
+    memcpy(resolved, index_path, prefix);
+    strcpy(resolved + prefix, path);
+    return resolved;
 }
 
 char *now_iso8601(void) {

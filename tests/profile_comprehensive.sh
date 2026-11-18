@@ -299,6 +299,7 @@ compile_hts_benchmarks() {
     local htslib_prefix=${HTSLIB_PREFIX:-$ROOT/build/vendor/htslib}
     local lmdb_prefix=${LMDB_PREFIX:-$ROOT/build/vendor/lmdb}
     local bzip2_lib=${BZIP2_LIB:-$ROOT/build/vendor/bzip2/lib/libbz2.a}
+    local libdeflate_lib=${LIBDEFLATE_LIB:-$ROOT/build/vendor/libdeflate/lib/libdeflate.a}
     local htslib_inc=$htslib_prefix/include
     local htslib_lib=$htslib_prefix/lib/libhts.a
     local lmdb_lib=$lmdb_prefix/lib/liblmdb.a
@@ -312,6 +313,10 @@ compile_hts_benchmarks() {
         bzip_link=("$bzip2_lib")
     else
         bzip_link=(-lbz2)
+    fi
+    local libdeflate_link=()
+    if [[ -f $libdeflate_lib ]]; then
+        libdeflate_link=("$libdeflate_lib")
     fi
     cat > "$WORK/bench_hts.c" <<'C'
 #include <stdio.h>
@@ -397,7 +402,8 @@ int main(int argc, char **argv) {
 }
 C
     "$CC" -O3 -g -no-pie -I"$htslib_inc" "$WORK/bench_hts.c" -o "$WORK/bench_hts_native" \
-        "$htslib_lib" "${bzip_link[@]}" -lz -llzma -lm -lpthread -lzstd \
+        "$htslib_lib" "${bzip_link[@]}" "${libdeflate_link[@]}" \
+        -lz -llzma -lm -lpthread -lzstd \
         2> "$REPORT_DIR/compile.htslib-native.stderr" || {
             cat "$REPORT_DIR/compile.htslib-native.stderr" >&2
             exit 1
@@ -405,6 +411,7 @@ C
     "$CC" -O3 -g -no-pie -I"$ROOT/include" -I"$htslib_inc" -include htsisam/sam.h \
         "$WORK/bench_hts.c" -o "$WORK/bench_hts_compat" \
         "$ROOT/build/libisam.a" "$lmdb_lib" "$htslib_lib" "${bzip_link[@]}" \
+        "${libdeflate_link[@]}" \
         -lz -llzma -lm -lpthread -lzstd \
         2> "$REPORT_DIR/compile.htsisam.stderr" || {
             cat "$REPORT_DIR/compile.htsisam.stderr" >&2

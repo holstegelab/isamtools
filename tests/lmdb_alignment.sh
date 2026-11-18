@@ -53,6 +53,13 @@ test -f "$WORK/view.lmdb.isam-lock"
 "$TOOL" sort --all "$WORK/view.lmdb.isam"
 
 [[ $("$TOOL" view -c "$WORK/view.lmdb.isam") == 8 ]]
+mv "$WORK/store.bam" "$WORK/store.bam.offline"
+mv "$WORK/store.lmdb.ssam" "$WORK/store.lmdb.ssam.offline"
+[[ $("$TOOL" view -c "$WORK/view.lmdb.isam") == 8 ]]
+"$TOOL" view -c -o "$WORK/count.txt" "$WORK/view.lmdb.isam"
+[[ $(<"$WORK/count.txt") == 8 ]]
+mv "$WORK/store.bam.offline" "$WORK/store.bam"
+mv "$WORK/store.lmdb.ssam.offline" "$WORK/store.lmdb.ssam"
 [[ $("$TOOL" view -c -f 2048 "$WORK/view.lmdb.isam") == 1 ]]
 [[ $("$TOOL" view -c -F 2048 "$WORK/view.lmdb.isam") == 7 ]]
 [[ $("$TOOL" view -c "$WORK/view.lmdb.isam" '*') == 1 ]]

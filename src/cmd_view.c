@@ -2,11 +2,14 @@
 #include "view.h"
 #include "store.h"
 #include "rebuild.h"
+#include "reference.h"
 #include "aux_tags.h"
 #include "../include/isam/isam.h"
 
 #include <htslib/hts.h>
+#include <htslib/bgzf.h>
 #include <getopt.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -37,17 +40,26 @@ static void usage(void) {
         "      --no-header  Suppress SAM header lines (default for SAM).\n"
         "  -c, --count      Count records instead of emitting them.\n"
         "  -o, --output P   Write output to file (default stdout).\n"
+        "      --write-index  Build OUTPUT.bai while writing a coordinate-ordered BAM.\n"
         "\n"
         "Input/reconstruction options:\n"
         "      --store P    Override store path.\n"
         "      --store-index P  Override store index path.\n"
         "  -T, --reference P Reference FASTA for CRAM payload decoding.\n"
+        "      --reference-path DIR  Verified, raw M5 reference files (alternative to -T).\n"
+        "      --prepare-reference DIR  Prepare a new raw-M5 directory from -T, then use it.\n"
         "  -@, --threads N  Worker threads for htslib I/O.\n"
+        "      --decode-threads N  Independent CRAM container decoders (1..64).\n"
+        "                   Coordinate output only, whole view or one region.\n"
+        "      --decode-lookahead N  Coordinate metadata window (1..65536; default 512).\n"
+        "      --cache-selected  Plan requested payloads; release them after final use.\n"
+        "                   Requires --decode-threads and an extra metadata pass.\n"
         "  -L, --targets-file P  BED file of regions to emit.\n"
         "      --regions-file P  BED file of regions to emit.\n"
         "  -M, --use-index  Accepted for samtools compatibility; indexed paths are used automatically.\n"
         "  -P, --fetch-pairs  Emit all alignments for reads selected by region/BED.\n"
-        "      --order ORD  full-scan order: coordinate (default) or name.\n"
+        "      --order ORD  full-scan order: coordinate (default), name, or store.\n"
+        "                   store streams the canonical input once; sort output before indexing.\n"
         "      --subset S   Only emit reads in named subset (view first, then store).\n"
         "\n"
         "Filtering options:\n"
@@ -628,6 +640,32 @@ static int view_filter_needs_bam(const view_filter_t *f) {
            f->n_tag_filters > 0;
 }
 
+static int view_filter_is_noop(const view_filter_t *f) {
+    return f->require_all == 0 &&
+           f->exclude_any == 0 &&
+           f->require_any == 0 &&
+           f->exclude_all == 0 &&
+           f->min_mapq == 0 &&
+           f->min_qlen == 0 &&
+           !f->subsample_active &&
+           f->read_groups.n == 0 &&
+           f->libraries.n == 0 &&
+           !f->qname_filter_active &&
+           f->n_tag_filters == 0;
+}
+
+static void write_count(const char *output_path, int64_t count) {
+    FILE *count_out = stdout;
+    if (strcmp(output_path, "-") != 0) {
+        count_out = fopen(output_path, "w");
+        if (!count_out)
+            die("cannot open output '%s': %s", output_path, strerror(errno));
+    }
+    fprintf(count_out, "%lld\n", (long long)count);
+    if (count_out != stdout && fclose(count_out) != 0)
+        die("error closing output '%s': %s", output_path, strerror(errno));
+}
+
 static int aux_integer_type(char type) {
     return type == 'c' || type == 'C' || type == 's' || type == 'S' ||
            type == 'i' || type == 'I';
@@ -695,18 +733,10 @@ static int passes_bam_filter(view_filter_t *f, sam_hdr_t *hdr,
     return 1;
 }
 
-static void rebuild_lmdb_record(view_t *v, const lmdb_view_record_t *rec,
-                                payload_cache_t *cache,
-                                bam1_t *canon_buf, bam1_t *out_buf,
+static void rebuild_from_payload(view_t *v, const lmdb_view_record_t *rec,
+                                const bam1_t *canon_buf, bam1_t *out_buf,
                                 const isam_tag_set_t *shared_tags,
                                 const isam_tag_set_t *dropped_tags) {
-    store_record_t srec;
-    if (!store_lookup_read_id(v->store, rec->store_read_id, &srec))
-        die("store_read_id '%lld' missing from store '%s' (run isamtools rehint)",
-            (long long)rec->store_read_id, v->store->store_path);
-    int rc = payload_cache_fetch(cache, v->store, &srec, canon_buf);
-    if (rc != 0) die("payload fetch failed for '%s' (rc=%d)", srec.qname, rc);
-
     isam_rebuild_bam(out_buf, canon_buf,
                      rec->flag, rec->tid, rec->pos0, rec->mapq,
                      rec->n_cigar, rec->cigar,
@@ -717,7 +747,6 @@ static void rebuild_lmdb_record(view_t *v, const lmdb_view_record_t *rec,
     isam_aux_tags_append_missing_from(canon_buf, out_buf, shared_tags, dropped_tags);
     lmdb_read_tags_apply(v->store->lmdb, rec->store_read_id, out_buf, 0);
     isam_aux_tags_remove(out_buf, dropped_tags);
-    store_record_clear(&srec);
 }
 
 static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
@@ -729,7 +758,7 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
                             const view_output_policy_t *output_policy,
                             const isam_tag_set_t *shared_tags,
                             const isam_tag_set_t *dropped_tags,
-                            int count_only) {
+                            int count_only, const bam1_t *stream_payload) {
     int selected = passes_record_filter(filter, rec) &&
                    overlaps_bed(bed_filter, rec->tid, rec->pos0, rec->end0);
     if (!selected && !output_policy->unmap_unselected)
@@ -738,8 +767,24 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
     if (!selected && output_policy->unmap_unselected)
         need_bam = 1;
     if (need_bam) {
-        rebuild_lmdb_record(v, rec, cache, canon_buf, out_buf,
-                            shared_tags, dropped_tags);
+        const bam1_t *payload = stream_payload;
+        if (!stream_payload) {
+            store_record_t srec;
+            if (!store_lookup_read_id(v->store, rec->store_read_id, &srec))
+                die("store_read_id '%lld' missing from store '%s' (run isamtools rehint)",
+                    (long long)rec->store_read_id, v->store->store_path);
+            int rc;
+            if (!v->store->is_bam && v->store->slice_cache)
+                rc = store_borrow_payload(v->store, &srec, canon_buf, &payload);
+            else {
+                rc = payload_cache_fetch(cache, v->store, &srec, canon_buf);
+                payload = canon_buf;
+            }
+            if (rc != 0) die("payload fetch failed for '%s' (rc=%d)", srec.qname, rc);
+            store_record_clear(&srec);
+        }
+        rebuild_from_payload(v, rec, payload,
+                             out_buf, shared_tags, dropped_tags);
         if (selected && !passes_bam_filter(filter, hdr, out_buf))
             selected = 0;
         if (!selected && !output_policy->unmap_unselected)
@@ -753,10 +798,227 @@ static int emit_lmdb_record(samFile *out_sam, sam_hdr_t *hdr,
     return 1;
 }
 
+/* Keep the production default while allowing isolated look-ahead benchmarks
+ * against the identical frozen decoder/library objects. */
+#ifndef ISAM_COORDINATE_WINDOW
+#define ISAM_COORDINATE_WINDOW 512
+#endif
+#if ISAM_COORDINATE_WINDOW < 1 || ISAM_COORDINATE_WINDOW > 65536
+#error "ISAM_COORDINATE_WINDOW must be in 1..65536"
+#endif
+enum { COORDINATE_WINDOW = ISAM_COORDINATE_WINDOW };
+
+static int coordinate_read_record(view_t *v, lmdb_view_iter_t *iterator,
+                                  lmdb_view_record_t *rec, store_record_t *store,
+                                  view_filter_t *filter,
+                                  const view_output_policy_t *policy) {
+    if (!lmdb_view_iter_next(iterator, rec)) return 0;
+    if (passes_record_filter(filter, rec) || policy->unmap_unselected)
+        if (!store_lookup_read_id(v->store, rec->store_read_id, store))
+            die("store_read_id '%lld' missing from store '%s'",
+                (long long)rec->store_read_id, v->store->store_path);
+    return 1;
+}
+
+static void coordinate_plan_payloads(view_t *v, lmdb_view_iter_t *iterator,
+                                      view_filter_t *filter,
+                                      const view_output_policy_t *policy) {
+    store_payload_plan_begin(v->store);
+    lmdb_view_record_t record;
+    store_record_t store = {0};
+    while (coordinate_read_record(v, iterator, &record, &store, filter, policy)) {
+        if (store.qname) store_payload_plan_add(v->store, &store);
+        lmdb_view_record_clear(&record);
+        store_record_clear(&store);
+    }
+    store_payload_plan_finish(v->store);
+}
+
+/* Advance the scheduling cursor once per metadata record, not by rescanning
+ * the entire resident lookahead on every output record. */
+static void coordinate_prefetch_window(store_t *st, store_record_t *stores,
+                                       size_t head, size_t count, size_t *cursor,
+                                       size_t capacity) {
+    while (*cursor < count) {
+        size_t start = (head + *cursor) % capacity;
+        size_t span = capacity - start;
+        if (span > count - *cursor) span = count - *cursor;
+        size_t examined = store_prefetch_payloads(st, stores + start, span);
+        *cursor += examined;
+        if (examined < span) break;
+    }
+}
+
+/* Rolling coordinate metadata ring. Decode workers stay active while current
+ * records are rebuilt/written; only a demanded container can block output. */
+static int64_t emit_coordinate_pipeline(samFile *out, view_t *v,
+                                       lmdb_view_iter_t *iterator,
+                                       bam1_t *scratch, bam1_t *outb,
+                                       view_filter_t *filter,
+                                       const view_output_policy_t *policy,
+                                       const isam_tag_set_t *shared_tags,
+                                       const isam_tag_set_t *dropped_tags,
+                                       size_t capacity) {
+    lmdb_view_record_t *records = xcalloc(capacity, sizeof *records);
+    store_record_t *stores = xcalloc(capacity, sizeof *stores);
+    int64_t emitted = 0;
+    size_t head = 0, count = 0, prefetched = 0;
+    int exhausted = 0;
+    while (count < capacity) {
+        if (!coordinate_read_record(v, iterator, &records[count], &stores[count], filter, policy)) {
+            exhausted = 1;
+            break;
+        }
+        ++count;
+    }
+    while (count) {
+        const bam1_t *payload = NULL;
+        /* A previously resident payload can have been evicted since the
+         * cursor passed it. Give a current miss priority over lookahead. */
+        if (stores[head].qname && !store_payload_cached(v->store, &stores[head]))
+            store_prefetch_payloads(v->store, &stores[head], 1);
+        coordinate_prefetch_window(v->store, stores, head, count, &prefetched, capacity);
+        if (stores[head].qname) {
+            int rc = store_borrow_payload(v->store, &stores[head], scratch, &payload);
+            if (rc) die("payload fetch failed for '%s' (rc=%d)", stores[head].qname, rc);
+        }
+        /* Consuming a pending result frees its ticket/decoder. Refill before
+         * reconstruction and compression, without changing cache residency. */
+        coordinate_prefetch_window(v->store, stores, head, count, &prefetched, capacity);
+        emitted += emit_lmdb_record(out, v->hdr, v, &records[head], NULL,
+                                    scratch, outb, filter, NULL, policy,
+                                    shared_tags, dropped_tags, 0, payload);
+        if (stores[head].qname) store_payload_release(v->store, &stores[head]);
+        lmdb_view_record_clear(&records[head]);
+        store_record_clear(&stores[head]);
+        head = (head + 1) % capacity;
+        --count;
+        if (prefetched) --prefetched;
+        if (!exhausted) {
+            size_t tail = (head + count) % capacity;
+            if (coordinate_read_record(v, iterator, &records[tail], &stores[tail], filter, policy))
+                ++count;
+            else
+                exhausted = 1;
+        }
+    }
+    free(stores);
+    free(records);
+    return emitted;
+}
+
+/* Match the exact payload locator, not just a primary flag: the canonical
+ * index may use a full-length supplementary-only record or upgrade a preceding
+ * supplementary record to a later primary. No retained input is rewritten. */
+static int64_t emit_store_order(samFile *out, view_t *v, bam1_t *canon,
+                                bam1_t *outb, view_filter_t *filter,
+                                const view_output_policy_t *policy,
+                                const isam_tag_set_t *shared_tags,
+                                const isam_tag_set_t *dropped_tags,
+                                int count_only) {
+    store_t *st = v->store;
+    if (!st->is_bam && (!st->cram_coff || st->cram_nc == 0))
+        die("store order requires a canonical CRAM container table; rebuild the store index");
+    int64_t raw = 0, ci = 0, base = 0, visited = 0, emitted = 0;
+    for (;;) {
+        int64_t voffset = st->is_bam ? bgzf_tell(st->sam->fp.bgzf) : -1;
+        int rc = sam_read1(st->sam, st->hdr, canon);
+        if (rc == -1) break;
+        if (rc < -1) die("error reading canonical store '%s' at record %lld",
+                         st->store_path, (long long)(raw + 1));
+        if (!st->is_bam) {
+            while (ci < st->cram_nc && raw >= base + st->cram_nrec[ci])
+                base += st->cram_nrec[ci++];
+            if (ci >= st->cram_nc)
+                die("canonical store has extra records beyond its container table");
+        }
+        ++raw;
+        if (canon->core.flag & BAM_FSECONDARY) continue;
+        store_record_t srec;
+        if (!store_lookup_qname(st, bam_get_qname(canon), &srec)) {
+            if (!(canon->core.flag & BAM_FSUPPLEMENTARY))
+                die("canonical primary '%s' is missing from its store index", bam_get_qname(canon));
+            continue;
+        }
+        int matches;
+        if (st->is_bam) {
+            if (!srec.has_voffset) die("store order requires BAM payload locators; rebuild the store index");
+            matches = srec.bam_voffset == voffset;
+        } else {
+            if (!srec.has_cram_loc) die("store order requires CRAM payload locators; rebuild the store index");
+            matches = srec.cram_coffset == st->cram_coff[ci] &&
+                      srec.cram_within == raw - 1 - base;
+        }
+        if (matches) {
+            lmdb_view_iter_t *it = lmdb_view_iter_open_read_id(v->lmdb, srec.read_id);
+            lmdb_view_record_t rec;
+            while (lmdb_view_iter_next(it, &rec)) {
+                ++visited;
+                emitted += emit_lmdb_record(out, v->hdr, v, &rec, NULL,
+                                             NULL, outb, filter, NULL, policy,
+                                             shared_tags, dropped_tags,
+                                             count_only, canon);
+                lmdb_view_record_clear(&rec);
+            }
+            lmdb_view_iter_close(it);
+        }
+        store_record_clear(&srec);
+    }
+    if (!st->is_bam) {
+        int64_t expected_raw = 0;
+        for (int64_t i = 0; i < st->cram_nc; ++i) expected_raw += st->cram_nrec[i];
+        if (raw != expected_raw) die("canonical CRAM record count differs from its container table");
+    }
+    if (visited != lmdb_view_record_count(v->lmdb))
+        die("store order reconstructed %lld view records; expected %lld (stale or incomplete store index)",
+            (long long)visited, (long long)lmdb_view_record_count(v->lmdb));
+    fprintf(stderr, "isamtools view: store scan %lld canonical records, %lld view records\n",
+            (long long)raw, (long long)visited);
+    return emitted;
+}
+
+/* HTSlib's local REF_PATH route mmaps raw uppercase reference files rather
+ * than rereading and normalizing FASTA on every multi-reference cache miss.
+ * Require complete coverage of the canonical header, so missing entries cannot
+ * silently fall back to the CRAM's original UR path or an online resolver.
+ * Files must have been checksum-verified when this directory was populated. */
+static void configure_reference_path(store_t *st, const char *directory) {
+    struct stat sb;
+    if (!*directory || strchr(directory, ':') || strchr(directory, '%') ||
+        stat(directory, &sb) != 0 || !S_ISDIR(sb.st_mode))
+        die("reference-path '%s' must be an existing directory without ':' or '%%'", directory);
+    kstring_t md5 = {0, 0, NULL}, filename = {0, 0, NULL};
+    for (int tid = 0; tid < sam_hdr_nref(st->hdr); ++tid) {
+        const char *name = sam_hdr_tid2name(st->hdr, tid);
+        if (sam_hdr_find_tag_id(st->hdr, "SQ", "SN", name, "M5", &md5) < 0 || md5.l != 32)
+            die("canonical reference '%s' lacks a valid M5 tag", name);
+        for (size_t i = 0; i < md5.l; ++i) {
+            if (!((md5.s[i] >= '0' && md5.s[i] <= '9') ||
+                  (md5.s[i] >= 'a' && md5.s[i] <= 'f') ||
+                  (md5.s[i] >= 'A' && md5.s[i] <= 'F')))
+                die("canonical reference '%s' has a non-hex M5 tag", name);
+        }
+        filename.l = 0;
+        if (ksprintf(&filename, "%s/%s", directory, md5.s) < 0)
+            die("cannot allocate reference-path filename");
+        if (stat(filename.s, &sb) != 0 || !S_ISREG(sb.st_mode) ||
+            sb.st_size != sam_hdr_tid2len(st->hdr, tid))
+            die("reference-path file '%s' is missing or has the wrong length for '%s'", filename.s, name);
+    }
+    filename.l = 0;
+    if (ksprintf(&filename, "%s/%%s", directory) < 0 ||
+        setenv("REF_PATH", filename.s, 1) != 0 || setenv("REF_CACHE", "", 1) != 0)
+        die("cannot configure local CRAM REF_PATH");
+    free(md5.s);
+    free(filename.s);
+}
+
 int cmd_view(int argc, char **argv) {
     const char *store_override = NULL;
     const char *store_idx_override = NULL;
     const char *reference_path = NULL;
+    const char *reference_m5_directory = NULL;
+    const char *prepare_reference_directory = NULL;
     const char *output_path = "-";
     const char *subset = NULL;
     const char *bed_path = NULL;
@@ -768,6 +1030,10 @@ int cmd_view(int argc, char **argv) {
     int count_only = 0;
     int fetch_pairs = 0;
     int n_threads = 0;
+    int decode_threads = 0;
+    int decode_lookahead = COORDINATE_WINDOW, lookahead_set = 0;
+    int cache_selected = 0;
+    int write_index = 0;
     const char *order = "coordinate";
     view_filter_t filter = { 0 };
     view_output_policy_t output_policy = { 0 };
@@ -799,7 +1065,12 @@ int cmd_view(int argc, char **argv) {
         {"regions-file", required_argument, 0, 'L'},
         {"count",       no_argument,       0, 'c'},
         {"reference",   required_argument, 0, 'T'},
+        {"reference-path", required_argument, 0, 1017},
+        {"prepare-reference", required_argument, 0, 1019},
         {"threads",     required_argument, 0, '@'},
+        {"decode-threads", required_argument, 0, 1018},
+        {"decode-lookahead", required_argument, 0, 1020},
+        {"cache-selected", no_argument, 0, 1021},
         {"use-index",   no_argument,       0, 'M'},
         {"no-PG",       no_argument,       0, 1008},
         {"unoutput",    required_argument, 0, 'U'},
@@ -908,9 +1179,25 @@ int cmd_view(int argc, char **argv) {
             parse_tag_list_into(&output_policy.keep_tags, optarg);
             output_policy.keep_tags_active = 1;
             break;
-        case 1014: unsupported_option("--write-index"); break;
+        case 1014: write_index = 1; break;
         case 1015: break;
         case 1016: unsupported_option("--input-fmt-option"); break;
+        case 1017: reference_m5_directory = optarg; break;
+        case 1019: prepare_reference_directory = optarg; break;
+        case 1020:
+            decode_lookahead = parse_nonnegative_int(optarg, "decode look-ahead");
+            if (decode_lookahead < 1 || decode_lookahead > 65536)
+                die("decode look-ahead must be in 1..65536");
+            lookahead_set = 1;
+            break;
+        case 1021: cache_selected = 1; break;
+        case 1018: {
+            int64_t workers = parse_nonnegative_int(optarg, "decode threads");
+            if (workers < 1 || workers > 64)
+                die("decode threads must be in 1..64");
+            decode_threads = (int)workers;
+            break;
+        }
         default: usage(); return 2;
         }
     }
@@ -919,8 +1206,34 @@ int cmd_view(int argc, char **argv) {
     int n_regions = argc - optind;
     char **regions = argv + optind;
     const char *region = n_regions == 1 ? regions[0] : NULL;
+    if (strcasecmp(order, "coordinate") && strcasecmp(order, "name") && strcasecmp(order, "store"))
+        die("unknown view order '%s' (expected coordinate, name, or store)", order);
+    int store_order = strcasecmp(order, "store") == 0;
+    if (store_order && (n_regions || bed_path || subset || fetch_pairs))
+        die("store order is a full scan and cannot be combined with regions, BED, subsets or fetch-pairs");
+    if (decode_threads && (strcasecmp(order, "coordinate") || n_regions > 1 ||
+                           bed_path || subset || fetch_pairs || count_only ||
+                           header_only || output_policy.unmap_unselected))
+        die("decode threads require coordinate output, whole view or one region, without BED/subset/fetch-pairs/count/unmap");
+    if ((lookahead_set || cache_selected) && !decode_threads)
+        die("--decode-lookahead and --cache-selected require --decode-threads");
+    if (write_index && (out_fmt != VIEW_OUT_BAM || !strcmp(output_path, "-") ||
+                        strcasecmp(order, "coordinate") || n_regions > 1 ||
+                        bed_path || subset || fetch_pairs || count_only ||
+                        header_only || output_policy.unmap_unselected))
+        die("--write-index requires a named coordinate BAM, whole view or one region, without BED/subset/fetch-pairs/count/header/unmap");
+    if (write_index) {
+        struct stat output_stat;
+        if (stat(output_path, &output_stat) == 0 && !S_ISREG(output_stat.st_mode))
+            die("--write-index requires a regular BAM output file");
+    }
     if (out_fmt == VIEW_OUT_CRAM && !reference_path)
         die("CRAM output requires -T/--reference");
+    if (reference_path && reference_m5_directory)
+        die("choose either -T/--reference or --reference-path, not both");
+    if (prepare_reference_directory && (!reference_path || reference_m5_directory ||
+                                      count_only || header_only || out_fmt == VIEW_OUT_CRAM))
+        die("--prepare-reference requires -T and SAM/BAM record output, without --reference-path");
     if (out_fmt == VIEW_OUT_SAM && compression_level >= 0)
         die("compression options require BAM or CRAM output");
     if (fetch_pairs && n_regions == 0 && !bed_path)
@@ -929,10 +1242,34 @@ int cmd_view(int argc, char **argv) {
         die("-P/--fetch-pairs cannot be combined with -p/--unmap");
 
     view_t *v = view_open_read(isam_path);
+    if (count_only && !header_only && n_regions == 0 && !bed_path &&
+        !subset && !qname_path && !fetch_pairs && view_filter_is_noop(&filter)) {
+        int64_t count = lmdb_view_record_count(v->lmdb);
+        write_count(output_path, count);
+        view_filter_destroy(&filter);
+        view_output_policy_destroy(&output_policy);
+        view_close(v);
+        return 0;
+    }
     view_link_store(v, store_override, store_idx_override);
-    if (!v->store->is_bam && !reference_path)
-        die("canonical store '%s' is CRAM; -T/--reference is required to decode read payload",
+    if (prepare_reference_directory) {
+        if (v->store->is_bam) die("--prepare-reference requires a canonical CRAM store");
+        if (isam_reference_prepare(v->store->hdr, reference_path, prepare_reference_directory) < 0)
+            die("raw-reference preparation failed");
+        reference_m5_directory = prepare_reference_directory;
+        reference_path = NULL;
+    }
+    if (!v->store->is_bam && !reference_path && !reference_m5_directory)
+        die("canonical store '%s' is CRAM; -T/--reference or --reference-path is required to decode read payload",
             v->store->store_path);
+    if (reference_m5_directory) {
+        if (v->store->is_bam) die("--reference-path requires a canonical CRAM store");
+        configure_reference_path(v->store, reference_m5_directory);
+    }
+    if (!v->store->is_bam && reference_path && !store_order && !count_only && !header_only)
+        warnx_("FASTA coordinate decoding can be slower. Prepare raw references with "
+               "'isamtools ref-index --cram STORE -T FASTA -o DIR', then use "
+               "'--reference-path DIR'; or add '--prepare-reference DIR' for one-step preparation.");
     if (qname_path) {
         filter.qname_filter_active = 1;
         load_qname_file(v, &filter.qname_ids, qname_path);
@@ -981,9 +1318,15 @@ int cmd_view(int argc, char **argv) {
     if (reference_path &&
         hts_set_fai_filename(v->store->sam, reference_path) != 0)
         die("cannot set reference FASTA '%s'", reference_path);
-    if (n_threads > 1 &&
+    /* Container-locator reads seek after each cache miss. HTSlib's threaded
+     * CRAM reader prefetches additional slices, then cram_seek drains and
+     * discards that work. Decode only the requested container synchronously;
+     * retain parallel I/O for BAM/legacy readers and output compression. */
+    if (n_threads > 1 && (store_order || v->store->is_bam || !v->store->slice_cache) &&
         hts_set_threads(v->store->sam, n_threads) != 0)
         die("cannot set store threads to %d", n_threads);
+    if (decode_threads)
+        store_set_decode_threads(v->store, decode_threads, reference_path);
     int have_subset = 0;
     int subset_from_store = 0;
     int64_t subset_id = 0;
@@ -1017,8 +1360,20 @@ int cmd_view(int argc, char **argv) {
     if (out && n_threads > 1 && hts_set_threads(out, n_threads) != 0)
         die("cannot set output threads to %d", n_threads);
 
+    if (store_order) {
+        if (sam_hdr_update_hd(v->hdr, "SO", "unsorted") != 0 ||
+            sam_hdr_remove_tag_hd(v->hdr, "SS") < 0)
+            die("cannot mark store-order output header as unsorted");
+    }
+
     if (out && (print_header || out_fmt != VIEW_OUT_SAM)) {
         if (sam_hdr_write(out, v->hdr) < 0) die("sam_hdr_write failed");
+    }
+    kstring_t index_path = {0, 0, NULL};
+    if (write_index) {
+        if (ksprintf(&index_path, "%s.bai", output_path) < 0 ||
+            sam_idx_init(out, v->hdr, 0, index_path.s) < 0)
+            die("cannot initialize BAM output index '%s'", output_path);
     }
     if (header_only) {
         bed_filter_destroy(&bed_filter);
@@ -1101,7 +1456,10 @@ int cmd_view(int argc, char **argv) {
         }
     }
 
-    if (!output_policy.unmap_unselected &&
+    if (store_order) {
+        n_emit = emit_store_order(out, v, canon, outb, &filter, &output_policy,
+                                  &shared_tags, &dropped_tags, count_only);
+    } else if (!output_policy.unmap_unselected &&
         have_subset && !subset_from_store && (use_bed_filter || region)) {
         lmdb_view_iter_t *it = lmdb_view_iter_open_subset(v->lmdb, subset_id);
         lmdb_view_record_t rec;
@@ -1120,7 +1478,7 @@ int cmd_view(int argc, char **argv) {
                                             use_bed_filter ? &bed_filter : NULL,
                                             &output_policy,
                                             &shared_tags, &dropped_tags,
-                                            fetch_pairs ? 1 : count_only);
+                                            fetch_pairs ? 1 : count_only, NULL);
             if (fetch_pairs) {
                 if (selected) i64_set_add(&pair_reads, rec.store_read_id);
             } else {
@@ -1163,7 +1521,7 @@ int cmd_view(int argc, char **argv) {
                                                     &bed_filter,
                                                     &output_policy,
                                                     &shared_tags, &dropped_tags,
-                                                    fetch_pairs ? 1 : count_only);
+                                                    fetch_pairs ? 1 : count_only, NULL);
                     if (fetch_pairs) {
                         if (selected) i64_set_add(&pair_reads, rec.store_read_id);
                     } else {
@@ -1176,7 +1534,10 @@ int cmd_view(int argc, char **argv) {
         }
         seen_aln_ids_destroy(&seen);
     } else {
-        if (!region && have_subset && !subset_from_store) {
+        if (count_only && !region && !use_bed_filter &&
+            (!have_subset || subset_from_store)) {
+            iter_kind = LMDB_VIEW_ITER_RECORD;
+        } else if (!region && have_subset && !subset_from_store) {
             iter_kind = LMDB_VIEW_ITER_SUBSET;
         } else if (!region && strcasecmp(order, "name") == 0) {
             iter_kind = LMDB_VIEW_ITER_NAME;
@@ -1192,7 +1553,19 @@ int cmd_view(int argc, char **argv) {
                 : lmdb_view_iter_open_subset(v->lmdb, subset_id))
             : lmdb_view_iter_open(v->lmdb, iter_kind, tid, beg, end);
         lmdb_view_record_t rec;
-        while (lmdb_view_iter_next(it, &rec)) {
+        if (decode_threads) {
+            if (iter_kind != LMDB_VIEW_ITER_COORD && iter_kind != LMDB_VIEW_ITER_REGION &&
+                iter_kind != LMDB_VIEW_ITER_UNMAPPED)
+                die("decode threads require a coordinate-indexed view");
+            if (cache_selected) {
+                coordinate_plan_payloads(v, it, &filter, &output_policy);
+                lmdb_view_iter_close(it);
+                it = lmdb_view_iter_open(v->lmdb, iter_kind, tid, beg, end);
+            }
+            n_emit += emit_coordinate_pipeline(out, v, it, canon, outb, &filter,
+                                              &output_policy, &shared_tags, &dropped_tags,
+                                              (size_t)decode_lookahead);
+        } else while (lmdb_view_iter_next(it, &rec)) {
             if (have_subset && subset_from_store &&
                 !subset_contains(v, subset_from_store, subset_id,
                                  rec.store_read_id)) {
@@ -1204,7 +1577,7 @@ int cmd_view(int argc, char **argv) {
                                             use_bed_filter ? &bed_filter : NULL,
                                             &output_policy,
                                             &shared_tags, &dropped_tags,
-                                            fetch_pairs ? 1 : count_only);
+                                            fetch_pairs ? 1 : count_only, NULL);
             if (fetch_pairs) {
                 if (selected) i64_set_add(&pair_reads, rec.store_read_id);
             } else {
@@ -1228,7 +1601,7 @@ int cmd_view(int argc, char **argv) {
                                                canon, outb, &filter, NULL,
                                                &output_policy,
                                                &shared_tags, &dropped_tags,
-                                               count_only);
+                                               count_only, NULL);
                 lmdb_view_record_clear(&rec);
             }
             lmdb_view_iter_close(it);
@@ -1237,15 +1610,7 @@ int cmd_view(int argc, char **argv) {
     }
 
     if (count_only) {
-        FILE *count_out = stdout;
-        if (strcmp(output_path, "-") != 0) {
-            count_out = fopen(output_path, "w");
-            if (!count_out)
-                die("cannot open output '%s': %s", output_path, strerror(errno));
-        }
-        fprintf(count_out, "%lld\n", (long long)n_emit);
-        if (count_out != stdout && fclose(count_out) != 0)
-            die("error closing output '%s': %s", output_path, strerror(errno));
+        write_count(output_path, n_emit);
     }
     i64_set_destroy(&pair_reads);
     bed_filter_destroy(&bed_filter);
@@ -1256,7 +1621,10 @@ int cmd_view(int argc, char **argv) {
     isam_tag_set_destroy(&dropped_tags);
     bam_destroy1(canon);
     bam_destroy1(outb);
-    if (out) sam_close(out);
+    if (write_index && sam_idx_save(out) < 0)
+        die("cannot save BAM output index '%s'", index_path.s);
+    if (out && sam_close(out) < 0) die("cannot close output '%s'", output_path);
+    free(index_path.s);
     view_close(v);
     return 0;
 }

@@ -11,14 +11,10 @@ static const char *const builtin_read_tags[] = {
 
 static const char *const builtin_alignment_tags[] = {
     "AM", "AS", "BQ", "CC", "CG", "CM", "CP", "CQ", "CS", "E2",
-    "H0", "H1", "H2", "HI", "IH", "MC", "MD", "MQ", "NH", "NM",
+    "H0", "H1", "H2", "HI", "HP", "IH", "MC", "MD", "MQ", "NH", "NM",
     "OA", "OC", "OP", "PQ", "Q2", "R2", "SA", "SM", "TC", "TS",
-    "U2", "UQ", "tp", "cm", "s1", "s2", "ms", "nn", "dv", "de",
+    "U2", "UQ", "PS", "tp", "cm", "s1", "s2", "ms", "nn", "dv", "de",
     "cg", "cs", "mc", "rm"
-};
-
-static const char *const builtin_carried_tags[] = {
-    "HP", "PS"
 };
 
 static const char *const pacbio_read_tags[] = {
@@ -207,9 +203,6 @@ void isam_tag_classifier_init(isam_tag_classifier_t *classifier,
     tag_set_add_static(&classifier->effective_shared_tags,
                        nanopore_read_tags,
                        sizeof nanopore_read_tags / sizeof nanopore_read_tags[0]);
-    tag_set_add_static(&classifier->effective_carried_tags,
-                       builtin_carried_tags,
-                       sizeof builtin_carried_tags / sizeof builtin_carried_tags[0]);
     if (stored_shared_tags_csv && isam_tag_set_parse_csv(&classifier->configured_shared_tags,
                                                          stored_shared_tags_csv) != 0)
         die("invalid stored shared tag list '%s'", stored_shared_tags_csv);
@@ -327,10 +320,6 @@ const char *isam_tag_classifier_source(const isam_tag_classifier_t *classifier,
                           sizeof builtin_alignment_tags / sizeof builtin_alignment_tags[0],
                           tag))
         return "builtin-alignment";
-    if (tag_list_contains(builtin_carried_tags,
-                          sizeof builtin_carried_tags / sizeof builtin_carried_tags[0],
-                          tag))
-        return "builtin-carried";
     return "unknown";
 }
 
@@ -366,6 +355,28 @@ int isam_aux_field_payload_len(const uint8_t *field) {
         errno = EINVAL;
         return -1;
     }
+}
+
+uint64_t isam_aux_field_fingerprint(const uint8_t *field) {
+    int payload_len = isam_aux_field_payload_len(field);
+    if (payload_len < 0)
+        die("invalid aux field while computing fingerprint");
+
+    /* FNV-1a over the BAM type, explicit payload length, and raw payload.
+     * The length makes distinct variable-width encodings unambiguous. */
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    hash ^= (uint8_t)bam_aux_type(field);
+    hash *= UINT64_C(0x100000001b3);
+    uint64_t len = (uint64_t)payload_len;
+    for (unsigned i = 0; i < 8; ++i) {
+        hash ^= (uint8_t)(len >> (i * 8));
+        hash *= UINT64_C(0x100000001b3);
+    }
+    for (int i = 0; i < payload_len; ++i) {
+        hash ^= field[1 + i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
 }
 
 void isam_aux_tags_append_missing_from(const bam1_t *src,

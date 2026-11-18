@@ -46,13 +46,18 @@ isamtools view sample.hg38.isam chr1:1000000-2000000
 
 Output is standard SAM/BAM, compatible with any downstream htslib-based tool.
 
+For fast whole-view export, see [optimizing ISAM to BAM performance](docs/performance.md):
+verified raw references, input placement, selected-payload caching, worker sizing
+and inline BAM indexing. Choose settings for your available resources and
+measure representative input; the guide includes illustrative benchmark results.
+
 ## Annotations and subsets
 
 ### Adding per-read tags
 
 Canonical tags that should be shared across imported views can be selected at
-index time. Source-specific read-wide tags such as haplotype assignment `HP`
-and phase set `PS` are carried by imports and stored once per read.
+index time. Haplotype assignment `HP` and phase set `PS` remain alignment-local
+by default because one read can have alignments in different phase sets.
 
 Share canonical tags at index time:
 
@@ -113,6 +118,7 @@ The canonical BAM/CRAM is kept as the single source of read data.
 | Command | Purpose |
 |---------|---------|
 | `index` | Build or rebuild a canonical store index from a BAM/CRAM. |
+| `ref-index` | Prepare checksum-verified raw genome references for fast decoding. |
 | `import` | Import an alternate alignment as a lightweight `.isam` view. |
 | `check` | Verify BAM/CRAM/SAM content against a store or view. |
 | `sort` | Build coordinate, name, and/or interval indexes on a view. |
@@ -146,6 +152,31 @@ See [docs/htslib-compat-migration.md](docs/htslib-compat-migration.md) for the
 three migration paths (compile-time `-include`, single header swap, or explicit
 `htsisam_*` calls) and a worked example for the `otter` assembler.
 
+Unmodified programs, including an existing `pysam` installation, do not acquire
+that shim automatically. For these programs, use
+[a temporary indexed BAM on node-local SSD](docs/temporary-bam.md).
+`tools/run_with_bam.py` creates and checks the BAM, runs a synchronous consumer,
+and removes its temporary data afterwards; the canonical CRAM and iSAM views
+remain unchanged. Its default `auto` strategy streams/sorts whole iSAM views
+and retains indexed coordinate access for regions. Private SSD index staging
+is the default. For direct coordinate reconstruction, select `--strategy coordinate`
+explicitly with verified raw M5 references. Tune `--decode-threads`,
+`--decode-lookahead` and output workers to your workload; `--cache-selected`
+reduces retained payloads and `--write-index` avoids a separate indexing pass.
+See the [performance guide](docs/performance.md) for runnable examples,
+resource-sizing principles and profiling guidance.
+The helper's `auto` strategy remains unchanged.
+
+Prepare those references with the built-in command:
+
+```bash
+isamtools ref-index --cram canon.cram -T canonical_hg38.fa -o canonical_hg38.m5
+```
+
+Or use `view -T canonical_hg38.fa --prepare-reference canonical_hg38.m5` for
+explicit one-step preparation and conversion. Ordinary FASTA coordinate
+decoding prints a performance hint. See [ref-index](docs/commands/ref-index.md).
+
 ## Build
 
 ```bash
@@ -158,7 +189,8 @@ libraries, and links `build/isamtools`. The binary has no runtime dependency on
 system-installed htslib, LMDB, or libbz2.
 
 Requirements: `cc`, `make`, `curl` or `wget`, `tar`, and development headers
-for `zlib` and `liblzma`. `samtools` is needed only to run the shell tests.
+for `zlib` and `liblzma`. `samtools` is needed for tests and the temporary-BAM
+helper; Python 3.9+ is needed for the helper and its tests.
 
 ```bash
 make test          # run functional tests

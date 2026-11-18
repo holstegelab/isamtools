@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := all
 
 CC ?= cc
+PYTHON ?= python3
 AR ?= ar
 RANLIB ?= ranlib
 MAKE ?= make
@@ -9,6 +10,7 @@ BUILD_DIR ?= build
 HTSLIB_VERSION ?= 1.23.1
 LMDB_VERSION ?= LMDB_0.9.31
 BZIP2_VERSION ?= 1.0.8
+LIBDEFLATE_VERSION ?= 1.25
 
 DOWNLOAD_DIR := $(BUILD_DIR)/downloads
 VENDOR_SRC_DIR := $(BUILD_DIR)/vendor/src
@@ -17,26 +19,32 @@ OBJ_DIR := $(BUILD_DIR)/obj
 HTSLIB_URL ?= https://github.com/samtools/htslib/releases/download/$(HTSLIB_VERSION)/htslib-$(HTSLIB_VERSION).tar.bz2
 LMDB_URL ?= https://github.com/LMDB/lmdb/archive/$(LMDB_VERSION).tar.gz
 BZIP2_URL ?= https://sourceware.org/pub/bzip2/bzip2-$(BZIP2_VERSION).tar.gz
+LIBDEFLATE_URL ?= https://github.com/ebiggers/libdeflate/releases/download/v$(LIBDEFLATE_VERSION)/libdeflate-$(LIBDEFLATE_VERSION).tar.gz
 
 HTSLIB_ARCHIVE := $(DOWNLOAD_DIR)/htslib-$(HTSLIB_VERSION).tar.bz2
 LMDB_ARCHIVE := $(DOWNLOAD_DIR)/lmdb-$(LMDB_VERSION).tar.gz
 BZIP2_ARCHIVE := $(DOWNLOAD_DIR)/bzip2-$(BZIP2_VERSION).tar.gz
+LIBDEFLATE_ARCHIVE := $(DOWNLOAD_DIR)/libdeflate-$(LIBDEFLATE_VERSION).tar.gz
 
 HTSLIB_SRC := $(VENDOR_SRC_DIR)/htslib-$(HTSLIB_VERSION)
 LMDB_SRC := $(VENDOR_SRC_DIR)/lmdb-$(LMDB_VERSION)/libraries/liblmdb
 BZIP2_SRC := $(VENDOR_SRC_DIR)/bzip2-$(BZIP2_VERSION)
+LIBDEFLATE_SRC := $(VENDOR_SRC_DIR)/libdeflate-$(LIBDEFLATE_VERSION)
+LIBDEFLATE_BUILD := $(BUILD_DIR)/vendor/build/libdeflate
 
 HTSLIB_PREFIX := $(abspath $(BUILD_DIR)/vendor/htslib)
 LMDB_PREFIX := $(abspath $(BUILD_DIR)/vendor/lmdb)
 BZIP2_PREFIX := $(abspath $(BUILD_DIR)/vendor/bzip2)
+LIBDEFLATE_PREFIX := $(abspath $(BUILD_DIR)/vendor/libdeflate)
 
 HTSLIB_LIB := $(HTSLIB_PREFIX)/lib/libhts.a
 LMDB_LIB := $(LMDB_PREFIX)/lib/liblmdb.a
 BZIP2_LIB := $(BZIP2_PREFIX)/lib/libbz2.a
+LIBDEFLATE_LIB := $(LIBDEFLATE_PREFIX)/lib/libdeflate.a
 
-HTSLIB_CONFIGURE_FLAGS ?= --disable-libcurl --disable-plugins --disable-s3 --disable-gcs --without-libdeflate
-HTSLIB_CONFIGURE_CPPFLAGS ?= -I$(BZIP2_PREFIX)/include
-HTSLIB_CONFIGURE_LDFLAGS ?= -L$(BZIP2_PREFIX)/lib
+HTSLIB_CONFIGURE_FLAGS ?= --disable-libcurl --disable-plugins --disable-s3 --disable-gcs --with-libdeflate
+HTSLIB_CONFIGURE_CPPFLAGS ?= -I$(BZIP2_PREFIX)/include -I$(LIBDEFLATE_PREFIX)/include
+HTSLIB_CONFIGURE_LDFLAGS ?= -L$(BZIP2_PREFIX)/lib -L$(LIBDEFLATE_PREFIX)/lib
 SYS_LIBS ?= -lz -llzma -lm -lpthread -lzstd
 EXE_LDFLAGS ?= -no-pie
 
@@ -48,6 +56,7 @@ LDFLAGS +=
 
 ISAM_SOURCES := \
 	src/common.c \
+	src/reference.c \
 	src/aux_tags.c \
 	src/backend_lmdb.c \
 	src/hash.c \
@@ -73,7 +82,7 @@ MAIN_OBJECT := $(OBJ_DIR)/src/main.o
 
 all: $(BUILD_DIR)/libisam.a $(BUILD_DIR)/isamtools
 
-deps: $(HTSLIB_LIB) $(LMDB_LIB) $(BZIP2_LIB)
+deps: $(HTSLIB_LIB) $(LMDB_LIB) $(BZIP2_LIB) $(LIBDEFLATE_LIB)
 
 packages: deps
 
@@ -84,6 +93,12 @@ test: all
 	TOOL=$(abspath $(BUILD_DIR)/isamtools) bash tests/tag_audit.sh
 	TOOL=$(abspath $(BUILD_DIR)/isamtools) bash tests/tag_policy.sh
 	TOOL=$(abspath $(BUILD_DIR)/isamtools) tests/lmdb_compat.sh
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_run_with_bam.py -v
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_store_order.py -v
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_coordinate_decode.py -v
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_reference_index.py -v
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_portable_paths.py -v
+	TOOL=$(abspath $(BUILD_DIR)/isamtools) $(PYTHON) -m unittest discover -s tests -p test_rebuild.py -v
 
 clean:
 	rm -rf $(OBJ_DIR) $(BUILD_DIR)/libisam.a $(BUILD_DIR)/isamtools
@@ -96,9 +111,11 @@ print-config:
 	@printf 'HTSLIB_VERSION=%s\n' '$(HTSLIB_VERSION)'
 	@printf 'LMDB_VERSION=%s\n' '$(LMDB_VERSION)'
 	@printf 'BZIP2_VERSION=%s\n' '$(BZIP2_VERSION)'
+	@printf 'LIBDEFLATE_VERSION=%s\n' '$(LIBDEFLATE_VERSION)'
 	@printf 'HTSLIB_PREFIX=%s\n' '$(HTSLIB_PREFIX)'
 	@printf 'LMDB_PREFIX=%s\n' '$(LMDB_PREFIX)'
 	@printf 'BZIP2_PREFIX=%s\n' '$(BZIP2_PREFIX)'
+	@printf 'LIBDEFLATE_PREFIX=%s\n' '$(LIBDEFLATE_PREFIX)'
 
 $(DOWNLOAD_DIR):
 	mkdir -p $@
@@ -136,6 +153,16 @@ $(BZIP2_ARCHIVE): | $(DOWNLOAD_DIR)
 		exit 1; \
 	fi
 
+$(LIBDEFLATE_ARCHIVE): | $(DOWNLOAD_DIR)
+	@if command -v curl >/dev/null 2>&1; then \
+		curl -LfsS '$(LIBDEFLATE_URL)' -o '$@'; \
+	elif command -v wget >/dev/null 2>&1; then \
+		wget -q -O '$@' '$(LIBDEFLATE_URL)'; \
+	else \
+		echo 'curl or wget is required to fetch libdeflate' >&2; \
+		exit 1; \
+	fi
+
 $(HTSLIB_SRC)/README: $(HTSLIB_ARCHIVE)
 	mkdir -p $(VENDOR_SRC_DIR)
 	tar -xjf '$<' -C $(VENDOR_SRC_DIR)
@@ -149,7 +176,11 @@ $(BZIP2_SRC)/Makefile: $(BZIP2_ARCHIVE)
 	mkdir -p $(VENDOR_SRC_DIR)
 	tar -xzf '$<' -C $(VENDOR_SRC_DIR)
 
-$(HTSLIB_LIB): $(HTSLIB_SRC)/README $(BZIP2_LIB)
+$(LIBDEFLATE_SRC)/CMakeLists.txt: $(LIBDEFLATE_ARCHIVE)
+	mkdir -p $(VENDOR_SRC_DIR)
+	tar -xzf '$<' -C $(VENDOR_SRC_DIR)
+
+$(HTSLIB_LIB): $(HTSLIB_SRC)/README $(BZIP2_LIB) $(LIBDEFLATE_LIB)
 	cd $(HTSLIB_SRC) && CPPFLAGS='$(HTSLIB_CONFIGURE_CPPFLAGS)' LDFLAGS='$(HTSLIB_CONFIGURE_LDFLAGS)' ./configure --prefix='$(HTSLIB_PREFIX)' $(HTSLIB_CONFIGURE_FLAGS)
 	rm -f $(HTSLIB_SRC)/htscodecs.mk
 	tar -xOf $(HTSLIB_ARCHIVE) htslib-$(HTSLIB_VERSION)/htscodecs_bundled.mk > $(HTSLIB_SRC)/htscodecs_bundled.mk
@@ -170,6 +201,17 @@ $(BZIP2_LIB): $(BZIP2_SRC)/Makefile
 	cp $(BZIP2_SRC)/bzlib.h $(BZIP2_PREFIX)/include/
 	cp $(BZIP2_SRC)/libbz2.a $(BZIP2_PREFIX)/lib/
 
+$(LIBDEFLATE_LIB): $(LIBDEFLATE_SRC)/CMakeLists.txt
+	cmake -S $(LIBDEFLATE_SRC) -B $(LIBDEFLATE_BUILD) \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX='$(LIBDEFLATE_PREFIX)' \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DLIBDEFLATE_BUILD_SHARED_LIB=OFF \
+		-DLIBDEFLATE_BUILD_GZIP=OFF \
+		-DLIBDEFLATE_BUILD_TESTS=OFF
+	cmake --build $(LIBDEFLATE_BUILD) --parallel 4
+	cmake --install $(LIBDEFLATE_BUILD)
+
 $(OBJ_DIR)/src/%.o: src/%.c | $(OBJ_DIR)/src $(HTSLIB_LIB) $(LMDB_LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -fvisibility=hidden -fPIC -MMD -MP -c $< -o $@
 
@@ -183,7 +225,7 @@ $(MAIN_OBJECT): src/main.c | $(OBJ_DIR)/src $(HTSLIB_LIB) $(LMDB_LIB)
 
 -include $(ISAM_OBJECTS:.o=.d) $(MAIN_OBJECT:.o=.d)
 
-$(BUILD_DIR)/isamtools: $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB)
-	$(CC) $(LDFLAGS) $(EXE_LDFLAGS) -o $@ $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB) $(SYS_LIBS)
+$(BUILD_DIR)/isamtools: $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB) $(LIBDEFLATE_LIB)
+	$(CC) $(LDFLAGS) $(EXE_LDFLAGS) -o $@ $(MAIN_OBJECT) $(BUILD_DIR)/libisam.a $(LMDB_LIB) $(HTSLIB_LIB) $(BZIP2_LIB) $(LIBDEFLATE_LIB) $(SYS_LIBS)
 
 .PHONY: all deps packages test clean distclean print-config

@@ -49,6 +49,15 @@ static uint8_t nt16_complement(uint8_t base) {
 
 static void copy_seq_slice(uint8_t *dst, const uint8_t *src,
                            int start, int len, int reverse) {
+    /* Most views retain the canonical orientation and complete sequence.
+     * Copy packed bases directly when the slice starts on a byte boundary;
+     * an odd final base must still leave the unused low nibble clear. */
+    if (!reverse && !(start & 1)) {
+        size_t bytes = (size_t)((len + 1) / 2);
+        memcpy(dst, src + start / 2, bytes);
+        if (len & 1) dst[bytes - 1] &= 0xf0;
+        return;
+    }
     memset(dst, 0, (size_t)((len + 1) / 2));
     for (int i = 0; i < len; ++i) {
         int src_i = reverse ? start + len - 1 - i : start + i;

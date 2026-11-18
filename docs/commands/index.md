@@ -10,6 +10,7 @@ isamtools index [options] <store.bam|store.cram>
 
 - `--name NAME`: set a logical alias for the store.
 - `-o, --output PATH`: write the index to `PATH` instead of `<store-root>.ssam`.
+- `-@, --threads N`: use `N` worker threads for BAM/CRAM decompression.
 - `--share-tags TAGS`: add comma-separated aux tags to canonical
   reconstruction from the BAM/CRAM payload.
 - `--no-share-tags TAGS`: remove comma-separated aux tags from canonical
@@ -50,7 +51,7 @@ actually seen.
 
 ```bash
 isamtools index sample.chm13.bam
-isamtools index --name chm13 sample.chm13.cram
+isamtools index -@ 4 --name chm13 -T reference.fa sample.chm13.cram
 isamtools index -o sample.store.ssam sample.chm13.bam
 isamtools index --share-tags RX,MM,ML --no-share-tags MN sample.chm13.bam
 ```

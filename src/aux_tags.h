@@ -53,6 +53,7 @@ const char *isam_tag_classifier_source(const isam_tag_classifier_t *classifier,
                                        const char tag[2]);
 
 int isam_aux_field_payload_len(const uint8_t *field);
+uint64_t isam_aux_field_fingerprint(const uint8_t *field);
 void isam_aux_tags_append_missing_from(const bam1_t *src,
                                        bam1_t *dst,
                                        const isam_tag_set_t *include,

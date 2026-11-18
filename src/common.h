@@ -32,6 +32,11 @@ char *isam_index_path_for(const char *input_path);
 /* canonical store index path helper: replace trailing .bam/.cram/.sam with .ssam, else append .ssam. caller frees. */
 char *isam_store_index_path_for(const char *store_path);
 
+/* malloc'd paths; absolute paths and URIs are preserved. CLI paths use cwd,
+ * while relative persisted references use the containing index directory. */
+char *isam_path_absolute(const char *path);
+char *isam_path_relative_to_index(const char *index_path, const char *path);
+
 /* iso8601 utc timestamp, malloc'd */
 char *now_iso8601(void);
 

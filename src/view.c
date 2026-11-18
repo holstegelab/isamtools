@@ -67,15 +67,24 @@ sam_hdr_t *view_load_header(view_t *v) {
     return hdr;
 }
 
+/* Metadata belongs to the view's bundle. CLI overrides, by contrast, retain
+ * their normal cwd-relative meaning. Do not reinterpret absolute paths/URIs. */
+static char *view_meta_path(view_t *v, const char *key) {
+    char *path = view_meta_get(v, key);
+    char *resolved = isam_path_relative_to_index(v->path, path);
+    free(path);
+    return resolved;
+}
+
 void view_link_store(view_t *v,
                      const char *store_path_override,
                      const char *store_index_path_override) {
     char *sp = store_path_override ? xstrdup(store_path_override)
-                    : view_meta_get(v, "store_path");
+                    : view_meta_path(v, "store_path");
     if (!sp) die("view '%s' has no store_path; pass --store", v->path);
 
     char *sip = store_index_path_override ? xstrdup(store_index_path_override)
-                        : view_meta_get(v, "store_index_path");
+                        : view_meta_path(v, "store_index_path");
     if (!sip) sip = isam_store_index_path_for(sp);
 
     v->store = store_open(sp, sip);

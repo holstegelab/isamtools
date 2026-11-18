@@ -60,6 +60,8 @@ Two encoded record types are central:
   - canonical placement hints: `tid`, `pos0`, `end0`
   - flags: `flag`, `is_unmapped`
   - BAM location hint: `bam_voffset`, `has_voffset`
+  - CRAM location hint: `cram_coffset`, `cram_within`, `has_cram_loc`
+  - canonical shared-tag fingerprints: `(tag_code, fingerprint)` pairs
 - `lmdb_view_record_t`
   - `aln_id`, `store_read_id`
   - alignment state: `flag`, `tid`, `pos0`, `end0`, `mapq`
@@ -77,6 +79,8 @@ one logical access pattern. Iterator kinds are:
 - `LMDB_VIEW_ITER_REGION`: region scan using checkpoint-derived safe start.
 - `LMDB_VIEW_ITER_READ_ID`: one read and all of its alignments.
 - `LMDB_VIEW_ITER_SUBSET`: all alignments whose read is in a named subset.
+- `LMDB_VIEW_ITER_RECORD`: sequential primary-record scan used when output
+  order is irrelevant, such as whole-view filtered counts.
 
 Two higher-level wrappers sit on top of the backend:
 
@@ -217,6 +221,11 @@ Key properties:
 - Values carry a record version byte.
 - Unknown or malformed encodings are fatal errors.
 
+Canonical store record version 3 appends a count followed by `(u16 tag_code,
+u64 fingerprint)` pairs. Versions 1 and 2 remain readable; version 3 lets
+`import --fast-verify` compare canonical shared tags without fetching the full
+BAM/CRAM record. Full tag values are not duplicated into LMDB.
+
 This matters for ordered scans. For example:
 
 - `canonical_by_qname` sorts by `qname_hash` then `qname`.
@@ -248,17 +257,18 @@ Execution path:
    - `store_header_hash` from raw header text
    - `store_sq_hash` from the `@SQ` projection
 6. Stream the canonical file record by record.
-7. Skip secondary and supplementary records so one canonical identity is kept
-   per read name.
+7. Keep one canonical identity per read name, preferring a primary record and
+   otherwise retaining a non-hard-clipped supplementary fallback; skip
+   secondary and hard-clipped supplementary records.
 8. Assign `read_id = n_records + 1` in encounter order.
 9. Determine the effective read-level tag list from built-in tag lists, header
-  hints, and any `--read-level-tags` overrides.
+   hints, and explicit tag-policy overrides.
 10. Encode and insert the record into:
    - `canonical_by_id`
    - `canonical_by_qname`
 11. Store the effective read-level tag list in `meta`.
-12. Keep canonical aux tags in the original BAM/CRAM payload rather than
-  duplicating them into store LMDB.
+12. Store compact fingerprints of canonical shared tags in the record, while
+    keeping their full values only in the original BAM/CRAM payload.
 13. Track `store_max_read_len` and, for BAM, record `bam_voffset` as a payload
     hint.
 14. Periodically commit and reopen the write transaction for large inputs.

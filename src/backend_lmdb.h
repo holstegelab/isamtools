@@ -47,7 +47,13 @@ typedef struct lmdb_backend {
     void *read_aux_ddict;        /* ZSTD_DDict* */
     void *view_record_cdict;     /* ZSTD_CDict* */
     void *view_record_ddict;     /* ZSTD_DDict* */
+    void *import_pipeline;       /* ordered background record-compression queue */
 } lmdb_backend_t;
+
+typedef struct lmdb_tag_fingerprint {
+    uint16_t tag_code;
+    uint64_t fingerprint;
+} lmdb_tag_fingerprint_t;
 
 typedef struct lmdb_store_record {
     int64_t read_id;
@@ -63,6 +69,9 @@ typedef struct lmdb_store_record {
     int64_t cram_coffset;       /* CRAM payload hint: byte offset of the container (-1 if absent) */
     int32_t cram_within;        /* CRAM payload hint: record index within that container */
     int has_cram_loc;
+    lmdb_tag_fingerprint_t *tag_fingerprints;
+    size_t n_tag_fingerprints;
+    int has_tag_fingerprints;   /* record v3: zero entries still means canonical has no shared tags */
 } lmdb_store_record_t;
 
 typedef struct lmdb_view_record {
@@ -91,7 +100,8 @@ typedef enum lmdb_view_iter_kind {
     LMDB_VIEW_ITER_REGION = 3,
     LMDB_VIEW_ITER_READ_ID = 4,
     LMDB_VIEW_ITER_SUBSET = 5,
-    LMDB_VIEW_ITER_UNMAPPED = 6
+    LMDB_VIEW_ITER_UNMAPPED = 6,
+    LMDB_VIEW_ITER_RECORD = 7
 } lmdb_view_iter_kind_t;
 
 typedef struct lmdb_view_iter lmdb_view_iter_t;
@@ -103,6 +113,8 @@ void            lmdb_backend_close(lmdb_backend_t *b);
 void            lmdb_backend_begin(lmdb_backend_t *b);
 void            lmdb_backend_commit(lmdb_backend_t *b);
 void            lmdb_backend_abort(lmdb_backend_t *b);
+void            lmdb_view_set_import_compression_threads(lmdb_backend_t *b,
+                                                          int n_threads);
 void            lmdb_backend_meta_set(lmdb_backend_t *b,
                                       const char *key,
                                       const char *value);
@@ -159,6 +171,7 @@ int             lmdb_view_lookup_qname(lmdb_backend_t *b,
                                        int64_t *store_read_id);
 void            lmdb_view_put_import_record(lmdb_backend_t *b,
                                             const lmdb_view_record_t *rec);
+int64_t         lmdb_view_record_count(lmdb_backend_t *b);
 void            lmdb_view_clear_sorted(lmdb_backend_t *b,
                                        int clear_coord,
                                        int clear_interval);

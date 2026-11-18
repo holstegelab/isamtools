@@ -262,7 +262,7 @@ static void print_storage_explanation(const char *type) {
         printf("reconstruction\taln_by_id provides flags/position/CIGAR/mate/inline aux; read_aux_by_id adds per-read import aux; the linked store supplies canonical SEQ/QUAL and store annotations when viewing\n");
     } else if (strcmp(type, "store") == 0) {
         printf("role\tcanonical_store_index\n");
-        printf("stored_here\tcanonical read identity, qname lookup, placement hints, store-side annotations/subsets\n");
+        printf("stored_here\tcanonical read identity, qname lookup, placement hints, compact shared-tag fingerprints, store-side annotations/subsets\n");
         printf("stored_elsewhere\tfull primary BAM/CRAM records, including SEQ/QUAL and canonical aux, stay in the original store file\n");
         printf("reconstruction\tthis .ssam resolves read_id and payload offsets; canonical SEQ/QUAL and canonical aux are then read from the original BAM/CRAM\n");
     } else {

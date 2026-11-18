@@ -37,16 +37,31 @@ static void usage(void) {
         "  --verbose-tag-policy Print a detailed tag policy summary.\n"
         "  --allow-missing      Skip records whose QNAME isn't in the store.\n"
         "  --write-index        Run `sort --all` after import.\n"
-        "  --fast-verify        Verify shared read-level tags against the canonical on a\n"
-        "                       declining sample of PRIMARY reads instead of every read\n"
-        "                       (secondary/supplementary always verified). Faster; any\n"
-        "                       mismatch is reported. Reconstruction is identical when\n"
-        "                       shared tags are read-level (as for PacBio MM/ML/RG).\n"
+        "  -@, --threads N      Total worker budget for input decoding and record compression.\n"
+        "  --fast-verify        Compare primary-read shared tags with compact canonical\n"
+        "                       fingerprints in current .ssam indexes, avoiding payload\n"
+        "                       reads. Older indexes use declining sampling for primary\n"
+        "                       records and exact comparison for non-primary records.\n"
         "  -h, --help           Show this help.\n",
         stderr);
 }
 
-KHASH_SET_INIT_INT64(u64set)
+/* The keys combine a sequential read_id in the high 48 bits with a two-byte
+ * SAM tag in the low bits. khash's default int64 hash leaves strong patterns
+ * for that layout, causing long quadratic-probe chains. Mix all 64 bits before
+ * truncating to khint_t. */
+static khint_t read_tag_key_hash(khint64_t key) {
+    key ^= key >> 30;
+    key *= UINT64_C(0xbf58476d1ce4e5b9);
+    key ^= key >> 27;
+    key *= UINT64_C(0x94d049bb133111eb);
+    key ^= key >> 31;
+    return (khint_t)(key ^ (key >> 32));
+}
+
+#define read_tag_key_equal(a, b) ((a) == (b))
+KHASH_INIT(u64set, khint64_t, char, 0,
+           read_tag_key_hash, read_tag_key_equal)
 
 typedef struct tag_count {
     uint16_t tag_code;
@@ -318,6 +333,16 @@ static int64_t import_batch_limit(int64_t n_in) {
     return 10000;
 }
 
+static int parse_thread_count(const char *text) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' ||
+        value < 1 || value > INT_MAX)
+        die("--threads expects a positive integer, got '%s'", text);
+    return (int)value;
+}
+
 int cmd_import(int argc, char **argv) {
     const char *store_path = NULL;
     const char *store_idx  = NULL;
@@ -333,6 +358,7 @@ int cmd_import(int argc, char **argv) {
     int allow_missing = 0;
     int write_index   = 0;
     int fast_verify   = 0;
+    int n_threads     = 1;
 
     static struct option longopts[] = {
         {"fast-verify",   no_argument,       0, 1014},
@@ -349,11 +375,12 @@ int cmd_import(int argc, char **argv) {
         {"strict-tag-policy", no_argument,   0, 1011},
         {"verbose-tag-policy", no_argument,  0, 1012},
         {"check",        no_argument,       0, 1013},
+        {"threads",      required_argument, 0, '@'},
         {"help",          no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "h@:", longopts, NULL)) != -1) {
         switch (c) {
         case 1000: store_path = optarg; break;
         case 1001: store_idx  = optarg; break;
@@ -369,6 +396,7 @@ int cmd_import(int argc, char **argv) {
         case 1012: verbose_tag_policy = 1; break;
         case 1013: verify_after_import = 1; break;
         case 1014: fast_verify = 1; break;
+        case '@':  n_threads = parse_thread_count(optarg); break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
@@ -376,6 +404,8 @@ int cmd_import(int argc, char **argv) {
     if (optind >= argc) { usage(); return 2; }
     if (!store_path) die("--store is required");
     const char *input_path = argv[optind];
+    int input_threads = n_threads > 1 ? n_threads - 1 : 0;
+    int compression_threads = n_threads > 1 ? 1 : 0;
 
     char *aln_path_alloc = NULL;
     if (!aln_path) {
@@ -399,6 +429,8 @@ int cmd_import(int argc, char **argv) {
     /* Open input stream. */
     samFile *in = sam_open(input_path, "r");
     if (!in) die("cannot open input '%s'", input_path);
+    if (input_threads > 0 && hts_set_threads(in, input_threads) != 0)
+        die("cannot set input threads to %d", input_threads);
     const htsFormat *input_fmt = hts_get_format(in);
     int input_is_bam = (input_fmt && input_fmt->format == bam);
     sam_hdr_t *in_hdr = sam_hdr_read(in);
@@ -414,14 +446,20 @@ int cmd_import(int argc, char **argv) {
     /* Open / create output view. */
     prepare_import_output_path(aln_path);
     view_t *v = view_open_write(aln_path);
+    lmdb_view_set_import_compression_threads(v->lmdb, compression_threads);
 
     /* Persist view metadata. */
     view_meta_set(v, "backend",           "lmdb");
     view_meta_set(v, "isam_type",         "alignment");
     view_meta_set(v, "isam_version",      ISAM_SCHEMA_VIEW);
     view_meta_set(v, "isamtools_version", ISAM_VERSION);
-    view_meta_set(v, "store_path",        store_path);
-    view_meta_set(v, "store_index_path",  store_idx);
+    /* Import arguments are cwd-relative, not relative to the output view. */
+    char *store_path_meta = isam_path_absolute(store_path);
+    char *store_idx_meta = isam_path_absolute(store_idx);
+    view_meta_set(v, "store_path",        store_path_meta);
+    view_meta_set(v, "store_index_path",  store_idx_meta);
+    free(store_path_meta);
+    free(store_idx_meta);
     char *store_name = lmdb_backend_meta_get(store->lmdb, "name");
     char *shh = lmdb_backend_meta_get(store->lmdb, "store_header_hash");
     char *ssh = lmdb_backend_meta_get(store->lmdb, "store_sq_hash");
@@ -447,6 +485,10 @@ int cmd_import(int argc, char **argv) {
         fprintf(stderr,
             "isamtools import: importing alignments from %s -> %s using store %s\n",
             input_path, aln_path, store_path);
+        fprintf(stderr,
+            "isamtools import: worker threads: %d (%d input decompression, "
+            "%d record compression)\n",
+            n_threads, input_threads, compression_threads);
         fprintf(stderr,
             "isamtools import: matching QNAMEs against %s%s%s\n",
             store_idx,
@@ -555,25 +597,22 @@ int cmd_import(int argc, char **argv) {
     isam_tag_set_t observed_source_drop_tags;
     isam_tag_set_init(&observed_source_drop_tags);
 
-    /* Adaptive shared-tag verification (--fast-verify). The per-read canonical
-     * fetch only confirms that read-level shared tags (MM/ML/RG/PacBio per-read)
-     * equal the canonical's, which for valid data they always do. We verify the
-     * first VERIFY_WARMUP shared-tag reads, then only 1 in `verify_stride`, with
-     * the stride doubling after each run of VERIFY_GROW_AFTER consecutive matches
-     * and dropping back to 1 on any mismatch. A skipped read trusts the canonical
-     * (dedups the shared tag). Without --fast-verify every read is verified. */
-    /* Warmup force-verifies primary reads while the stride ramps (doubling after
-     * each VERIFY_GROW_AFTER matches); the ramp reaches VERIFY_STRIDE_MAX right at
-     * the end of warmup. Deep PacBio files have millions of reads, so a short
-     * warmup + fast ramp keeps the fixed fetch cost tiny while still sampling
-     * enough to trust the canonical (tag dedup verdicts need TAG_DEDUP_DECIDE
-     * primary observations, << warmup). */
+    /* Current store indexes carry one compact fingerprint per canonical shared
+     * tag, so --fast-verify can compare every record without fetching the
+     * canonical BAM/CRAM payload. For older indexes, retain the adaptive sampler
+     * for primary records: force-verify the first VERIFY_WARMUP reads, then verify
+     * 1 in `verify_stride`; double the stride after VERIFY_GROW_AFTER matches and
+     * reset it on a mismatch. Non-primary records are never sampled: compare them
+     * exactly so a repeated read-wide tag is not mistaken for a conflict. */
     const int64_t VERIFY_WARMUP = 4000;
     const int64_t VERIFY_STRIDE_MAX = 1024;
     const int64_t VERIFY_GROW_AFTER = 400;
     int64_t verify_stride = 1, ok_streak = 0;
-    int64_t n_shared_reads = 0, n_verified = 0, n_trusted = 0, n_tag_mismatch = 0;
-    int64_t n_suppl_stored = 0;   /* non-primary reads: shared tags stored, no fetch */
+    int64_t n_primary_shared_reads = 0;
+    int64_t n_verified = 0, n_trusted = 0, n_tag_mismatch = 0;
+    int64_t n_fingerprint_reads = 0;
+    int64_t n_fingerprint_match_fields = 0;
+    int64_t n_fingerprint_mismatch_fields = 0;
     /* learned per-tag dedup viability (see tag_dedup_stat_t above) */
     tag_dedup_stat_t tag_dedup[TAG_DEDUP_CAP];
     int n_tag_dedup = 0;
@@ -609,11 +648,13 @@ int cmd_import(int argc, char **argv) {
                                 (BAM_FSECONDARY | BAM_FSUPPLEMENTARY));
         int n_cigar = b->core.n_cigar;
         const uint32_t *cigar = bam_get_cigar(b);
-        bam1_t *filtered = bam_dup1(b);
-        if (!filtered) die("out of memory");
+        uint8_t *alignment_aux = NULL;
+        size_t alignment_aux_len = 0;
+        size_t alignment_aux_cap = 0;
         int canonical_loaded = 0;
         int do_verify = 1;       /* verify this read's shared tags vs canonical? */
         int verify_decided = 0;
+        int use_fingerprints = 0;
         int read_real_mismatch = 0;  /* an UNEXPECTED mismatch -> reset stride */
         uint8_t *read_aux = NULL;
         size_t read_aux_len = 0;
@@ -626,17 +667,11 @@ int cmd_import(int argc, char **argv) {
         for (uint8_t *field = bam_aux_first(b); field; field = bam_aux_next(b, field)) {
             char tag[3] = { bam_aux_tag(field)[0], bam_aux_tag(field)[1], 0 };
             if (isam_tag_set_contains(&dropped_tags, tag)) {
-                uint8_t *drop = bam_aux_get(filtered, tag);
-                if (drop && bam_aux_del(filtered, drop) != 0)
-                    die("failed to strip dropped aux tag '%s'", tag);
                 isam_tag_set_add(&observed_drop_tags, tag);
                 ++n_dropped_tag_fields;
                 continue;
             }
             if (isam_tag_set_contains(&source_dropped_tags, tag)) {
-                uint8_t *drop = bam_aux_get(filtered, tag);
-                if (drop && bam_aux_del(filtered, drop) != 0)
-                    die("failed to strip import-only dropped aux tag '%s'", tag);
                 isam_tag_set_add(&observed_source_drop_tags, tag);
                 ++n_source_dropped_tag_fields;
                 continue;
@@ -653,26 +688,43 @@ int cmd_import(int argc, char **argv) {
                 if (scope == ISAM_TAG_SCOPE_SHARED) {
                     ds = tag_dedup_get(tag_dedup, &n_tag_dedup, tag);
                     if (!verify_decided) {
-                        ++n_shared_reads;
-                        if (!is_primary_read) {
-                            /* Secondary/supplementary: hard-clipping shifts MM/ML
-                             * off the canonical primary and scalar CCS tags differ
-                             * by processing, so nothing dedups. Store every shared
-                             * tag verbatim -- never fetch, never touch the stride. */
+                        if (is_primary_read)
+                            ++n_primary_shared_reads;
+                        if (fast_verify && srec.has_tag_fingerprints) {
+                            /* A v3 SSAM stores a compact fingerprint for every
+                             * canonical shared tag. Compare every field on primary,
+                             * secondary and supplementary records without opening
+                             * the canonical BAM/CRAM payload. */
                             do_verify = 0;
-                            ++n_suppl_stored;
+                            use_fingerprints = 1;
+                            ++n_fingerprint_reads;
+                        } else if (!is_primary_read) {
+                            /* A secondary/supplementary record belongs to the same
+                             * molecular read. Verify its shared tags exactly rather
+                             * than declaring them different without comparison. */
+                            do_verify = 1;
+                            ++n_verified;
                         } else {
                             /* Primary reads sample-verify on a growing stride. */
                             do_verify = (!fast_verify) ||
-                                        (n_shared_reads <= VERIFY_WARMUP) ||
+                                        (n_primary_shared_reads <= VERIFY_WARMUP) ||
                                         (verify_stride <= 1) ||
-                                        (n_shared_reads % verify_stride == 0);
+                                        (n_primary_shared_reads % verify_stride == 0);
                             if (do_verify) ++n_verified; else ++n_trusted;
                         }
                         verify_decided = 1;
                     }
-                    if (!is_primary_read) {
-                        store_has_same = 0;   /* store this tag verbatim */
+                    if (use_fingerprints) {
+                        uint64_t canonical_fingerprint = 0;
+                        int found = store_record_tag_fingerprint(
+                            &srec, tag, &canonical_fingerprint);
+                        store_has_same = found &&
+                            canonical_fingerprint ==
+                                isam_aux_field_fingerprint(field);
+                        if (store_has_same)
+                            ++n_fingerprint_match_fields;
+                        else
+                            ++n_fingerprint_mismatch_fields;
                     } else if (do_verify) {
                         if (!canonical_loaded) {
                             int frc = payload_cache_fetch(canonical_cache, store,
@@ -742,18 +794,19 @@ int cmd_import(int argc, char **argv) {
                     isam_tag_set_add(&observed_source_overrides, tag);
                 else if (scope == ISAM_TAG_SCOPE_CARRIED)
                     isam_tag_set_add(&observed_carried_tags, tag);
-                uint8_t *drop = bam_aux_get(filtered, tag);
-                if (drop && bam_aux_del(filtered, drop) != 0)
-                    die("failed to strip stored-once aux tag '%s'", tag);
             } else if (scope == ISAM_TAG_SCOPE_ALIGNMENT) {
                 isam_tag_set_add(&observed_alignment_tags, tag);
                 ++n_alignment_tag_fields_kept_inline;
+                aux_blob_append_field(&alignment_aux, &alignment_aux_len,
+                                      &alignment_aux_cap, field);
             } else if (scope == ISAM_TAG_SCOPE_UNKNOWN) {
                 if (isam_tag_set_add(&observed_alignment_tags, tag) != 0)
                     die("invalid aux tag '%s' in '%s'", tag, input_path);
                 if (isam_tag_set_add(&observed_unknown_tags, tag) != 0)
                     die("invalid aux tag '%s' in '%s'", tag, input_path);
                 ++n_unknown_tag_fields_kept_inline;
+                aux_blob_append_field(&alignment_aux, &alignment_aux_len,
+                                      &alignment_aux_cap, field);
             }
         }
         if (errno && errno != ENOENT)
@@ -762,7 +815,7 @@ int cmd_import(int argc, char **argv) {
 
         /* Adapt the verification stride: grow after a run of matches, reset on
          * any mismatch (a shared tag differing from the canonical). */
-        if (fast_verify && verify_decided && do_verify) {
+        if (fast_verify && is_primary_read && verify_decided && do_verify) {
             if (read_real_mismatch) {
                 ++n_tag_mismatch;
                 verify_stride = 1;
@@ -774,12 +827,17 @@ int cmd_import(int argc, char **argv) {
             }
         }
 
-        const uint8_t *aux = bam_get_aux(filtered);
-        int aux_len = bam_get_l_aux(filtered);
+        if (alignment_aux_len > INT_MAX)
+            die("alignment aux blob is too large in '%s'", input_path);
+        const uint8_t *aux = alignment_aux;
+        int aux_len = (int)alignment_aux_len;
+        int64_t end0 = -1;
+        if (!is_unmapped && b->core.pos >= 0)
+            end0 = (int64_t)bam_endpos(b);
         if ((int64_t)b->core.l_qseq > max_query_len)
             max_query_len = b->core.l_qseq;
-        if (!is_unmapped && b->core.tid >= 0 && b->core.pos >= 0) {
-            int64_t span = (int64_t)bam_endpos(b) - (int64_t)b->core.pos;
+        if (end0 >= 0 && b->core.tid >= 0) {
+            int64_t span = end0 - (int64_t)b->core.pos;
             if (span > max_ref_span) max_ref_span = span;
         }
 
@@ -790,7 +848,7 @@ int cmd_import(int argc, char **argv) {
             .flag = b->core.flag,
             .tid = b->core.tid,
             .pos0 = (is_unmapped || b->core.pos < 0) ? -1 : (int64_t)b->core.pos,
-            .end0 = is_unmapped ? -1 : (int64_t)bam_endpos(b),
+            .end0 = end0,
             .mapq = b->core.qual,
             .n_cigar = n_cigar,
             .cigar = (uint32_t *)cigar,
@@ -809,7 +867,7 @@ int cmd_import(int argc, char **argv) {
                                       read_aux, read_aux_len);
         }
         free(read_aux);
-        bam_destroy1(filtered);
+        free(alignment_aux);
         store_record_clear(&srec);
 
         ++n_kept;
@@ -921,10 +979,15 @@ int cmd_import(int argc, char **argv) {
             (long long)max_ref_span);
     if (fast_verify)
         fprintf(stderr,
-                "isamtools import: --fast-verify: primary %lld verified / %lld trusted, "
-                "non-primary %lld stored verbatim (final stride 1/%lld, %lld stride resets); "
+                "isamtools import: --fast-verify: %lld payload-verified / "
+                "%lld fingerprint-verified (%lld fields matched, %lld differed/absent) / "
+                "%lld primary sampled-trusted (final stride 1/%lld, %lld stride resets); "
                 "shared tags that differ from the canonical are stored per read, not lost\n",
-                (long long)n_verified, (long long)n_trusted, (long long)n_suppl_stored,
+                (long long)n_verified,
+                (long long)n_fingerprint_reads,
+                (long long)n_fingerprint_match_fields,
+                (long long)n_fingerprint_mismatch_fields,
+                (long long)n_trusted,
                 (long long)verify_stride, (long long)n_tag_mismatch);
     fprintf(stderr, "isamtools import: aux tag storage summary\n");
     fprintf(stderr,

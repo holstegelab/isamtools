@@ -13,6 +13,7 @@ int cmd_rehint  (int argc, char **argv);
 int cmd_store_stats(int argc, char **argv);
 int cmd_audit_tags(int argc, char **argv);
 int cmd_query(int argc, char **argv);
+int cmd_ref_index(int argc, char **argv);
 
 static void usage(void) {
     fputs(
@@ -20,6 +21,7 @@ static void usage(void) {
         "\n"
         "Commands:\n"
         "  index      Build store .ssam (QNAME index) for a BAM/CRAM canonical store.\n"
+        "  ref-index  Prepare verified raw-M5 reference files for fast decoding.\n"
         "  import     Import an alternate alignment into a .isam alignment view.\n"
         "  check      Verify BAM/CRAM/SAM content against a store or view.\n"
         "  sort       Build coordinate / name / interval indexes on a .isam.\n"
@@ -42,6 +44,7 @@ int main(int argc, char **argv) {
     char **sub_argv = argv + 1;
 
     if (!strcmp(cmd, "index"))    return cmd_index   (sub_argc, sub_argv);
+    if (!strcmp(cmd, "ref-index")) return cmd_ref_index(sub_argc, sub_argv);
     if (!strcmp(cmd, "import"))   return cmd_import  (sub_argc, sub_argv);
     if (!strcmp(cmd, "check"))    return cmd_check   (sub_argc, sub_argv);
     if (!strcmp(cmd, "sort"))     return cmd_sort    (sub_argc, sub_argv);

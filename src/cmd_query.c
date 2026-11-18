@@ -294,6 +294,9 @@ static void add_source(query_source_t **sources,
                     path, store_type ? store_type : "<missing>");
             free(store_type);
             store_path = lmdb_backend_meta_get(lmdb, "store_path");
+            char *resolved = isam_path_relative_to_index(path, store_path);
+            free(store_path);
+            store_path = resolved;
             lmdb_backend_close(lmdb);
             if (!store_path)
                 die("store index '%s' has no store_path metadata", path);

@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 
 static void usage(void) {
     fputs(
@@ -30,8 +31,19 @@ static void usage(void) {
         "  --yes                 Accept tag policy warnings.\n"
     "  -o, --output P   Override default output path (<store-root>.ssam).\n"
         "  -T, --reference P  Reference FASTA (required for a CRAM canonical store).\n"
+        "  -@, --threads N  Worker threads for BAM/CRAM decompression.\n"
         "  -h, --help       Show this help.\n",
         stderr);
+}
+
+static int parse_thread_count(const char *text) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' ||
+        value < 1 || value > INT_MAX)
+        die("--threads expects a positive integer, got '%s'", text);
+    return (int)value;
 }
 
 /* Scan a CRAM canonical store's container index and return, in container order,
@@ -102,6 +114,39 @@ static int bam_has_hard_clip(const bam1_t *b) {
             return 1;
     }
     return 0;
+}
+
+static void canonical_record_set_tag_fingerprints(
+        lmdb_store_record_t *rec,
+        const bam1_t *record,
+        const isam_tag_classifier_t *classifier) {
+    size_t cap = 0;
+    errno = 0;
+    for (uint8_t *field = bam_aux_first(record); field;
+         field = bam_aux_next(record, field)) {
+        char tag[3] = { bam_aux_tag(field)[0], bam_aux_tag(field)[1], 0 };
+        if (isam_tag_classifier_scope(classifier, tag) != ISAM_TAG_SCOPE_SHARED)
+            continue;
+        uint16_t code = isam_tag_code(tag);
+        for (size_t i = 0; i < rec->n_tag_fingerprints; ++i) {
+            if (rec->tag_fingerprints[i].tag_code == code)
+                die("duplicate canonical aux tag '%s' for '%s'", tag,
+                    bam_get_qname(record));
+        }
+        if (rec->n_tag_fingerprints == cap) {
+            cap = cap ? cap * 2 : 16;
+            rec->tag_fingerprints = xrealloc(rec->tag_fingerprints,
+                                             cap * sizeof *rec->tag_fingerprints);
+        }
+        rec->tag_fingerprints[rec->n_tag_fingerprints++] =
+            (lmdb_tag_fingerprint_t){
+                .tag_code = code,
+                .fingerprint = isam_aux_field_fingerprint(field)
+            };
+    }
+    if (errno && errno != ENOENT)
+        die("corrupt canonical aux data for '%s'", bam_get_qname(record));
+    rec->has_tag_fingerprints = 1;
 }
 
 KHASH_SET_INIT_STR(strset)
@@ -338,7 +383,9 @@ static int index_lmdb(const char *store_path, const char *out_path,
     lmdb_store_put_meta(lmdb, "isam_type", "store");
     lmdb_store_put_meta(lmdb, "isam_version", ISAM_SCHEMA_STORE);
     lmdb_store_put_meta(lmdb, "isamtools_version", ISAM_VERSION);
-    lmdb_store_put_meta(lmdb, "store_path", store_path);
+    char *store_path_meta = isam_path_absolute(store_path);
+    lmdb_store_put_meta(lmdb, "store_path", store_path_meta);
+    free(store_path_meta);
     lmdb_store_put_meta(lmdb, "store_format", is_bam ? "bam" : "cram");
     lmdb_store_put_meta_i64(lmdb, "store_size_bytes", (int64_t)stbuf->st_size);
     lmdb_store_put_meta_i64(lmdb, "store_mtime_ns",
@@ -359,9 +406,10 @@ static int index_lmdb(const char *store_path, const char *out_path,
     lmdb_store_put_meta(lmdb, "no_share_tags", no_shared_tags);
     lmdb_store_put_meta(lmdb, "share_tags_user_added", user_shared_tags);
     lmdb_store_put_meta(lmdb, "tag_policy_version", "1");
+    lmdb_store_put_meta(lmdb, "canonical_tag_fingerprint_encoding", "fnv1a64-v1");
     fprintf(stderr, "isamtools index: tag policy before scanning\n");
     fprintf(stderr, "  store file: %s\n", store_path);
-    fprintf(stderr, "  canonical aux storage: not copied into the .ssam; reconstructed from the canonical BAM/CRAM payload when needed\n");
+    fprintf(stderr, "  canonical aux storage: compact shared-tag fingerprints are stored in the .ssam; full values remain in the canonical BAM/CRAM\n");
     fprintf(stderr, "  read-level reconstruction candidates from policy/header: %s\n",
             effective_shared_tags[0] ? effective_shared_tags : "none");
     fprintf(stderr, "  header-declared read-level candidates: %s\n",
@@ -507,7 +555,9 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 .cram_within = cram_loc_within,
                 .has_cram_loc = cram_has_loc
             };
+            canonical_record_set_tag_fingerprints(&rec, b, &classifier);
             lmdb_store_put_record(lmdb, &rec);
+            free(rec.tag_fingerprints);
             canonical_map_put(canonical_reads, qname, read_id, 1, is_unmapped);
             ++stats.n_indexed_records;
             if (is_unmapped) ++stats.n_indexed_unmapped_reads;
@@ -551,6 +601,7 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 .cram_within = cram_loc_within,
                 .has_cram_loc = cram_has_loc
             };
+            canonical_record_set_tag_fingerprints(&rec, b, &classifier);
             if (state && state->is_supplementary) {
                 lmdb_store_update_record(lmdb, &rec);
                 state->is_supplementary = 0;
@@ -562,6 +613,7 @@ static int index_lmdb(const char *store_path, const char *out_path,
                 if (is_unmapped) ++stats.n_indexed_unmapped_reads;
                 else ++stats.n_indexed_mapped_reads;
             }
+            free(rec.tag_fingerprints);
         }
 
         if ((int64_t)b->core.l_qseq > max_read_len)
@@ -676,6 +728,7 @@ int cmd_index(int argc, char **argv) {
     const char *share_tags = NULL;
     const char *no_share_tags = NULL;
     const char *reference = NULL;
+    int n_threads = 1;
     int yes = 0;
     int strict_tag_policy = 0;
     int verbose_tag_policy = 0;
@@ -689,11 +742,12 @@ int cmd_index(int argc, char **argv) {
         {"verbose-tag-policy", no_argument, 0, 1006},
         {"output", required_argument, 0, 'o'},
         {"reference", required_argument, 0, 'T'},
+        {"threads", required_argument, 0, '@'},
         {"help",   no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "o:T:h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "o:T:h@:", longopts, NULL)) != -1) {
         switch (c) {
         case 1000: name_alias = optarg; break;
         case 1002: share_tags = optarg; break;
@@ -703,6 +757,7 @@ int cmd_index(int argc, char **argv) {
         case 1006: verbose_tag_policy = 1; break;
         case 'o':  out_path   = optarg; break;
         case 'T':  reference  = optarg; break;
+        case '@':  n_threads  = parse_thread_count(optarg); break;
         case 'h':  usage(); return 0;
         default:   usage(); return 2;
         }
@@ -730,6 +785,10 @@ int cmd_index(int argc, char **argv) {
         if (hts_set_fai_filename(input, reference) != 0)
             die("cannot set reference FASTA '%s' for '%s'", reference, store_path);
     }
+    if (n_threads > 1 && hts_set_threads(input, n_threads) != 0)
+        die("cannot set input threads to %d", n_threads);
+    fprintf(stderr, "isamtools index: input decompression threads: %d\n",
+            n_threads);
 
     sam_hdr_t *hdr = sam_hdr_read(input);
     if (!hdr) die("cannot read header of '%s'", store_path);
