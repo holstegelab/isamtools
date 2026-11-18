@@ -138,6 +138,7 @@ and `--drop-source-tags` tune how source tags are stored for one imported view.
 Use `audit-tags` to preview the classification before indexing or importing.
 
 Detailed per-command documentation: [docs/commands/](docs/commands/).  
+Agent skill (workflow, validation before deleting source BAMs, gotchas): [skills/isamtools/SKILL.md](skills/isamtools/SKILL.md).  
 Storage layout and internal design: [docs/data-structures.md](docs/data-structures.md).
 
 ## Using `.isam` files with existing htslib programs
